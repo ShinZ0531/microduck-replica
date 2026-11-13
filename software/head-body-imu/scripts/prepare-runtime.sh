@@ -6,6 +6,10 @@ component_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime_dir="${1:-}"
 operation="${2:---check}"
 base_commit='eecac1878136d3188370a5f6460b7d0521cf845d'
+patches=(
+    "$component_dir/patches/head-bmi088.patch"
+    "$component_dir/patches/runtime-hardening.patch"
+)
 
 if [[ $# -lt 1 || $# -gt 2 || ! -d "$runtime_dir" ]]; then
     echo '用法：prepare-runtime.sh <原生运行时 checkout> [--check|--apply]' >&2
@@ -32,10 +36,28 @@ fi
 
 # 摘要约束补丁内容；git apply 同时拒绝已经存在的新增目标文件。
 (cd "$component_dir/patches" && sha256sum --check SHA256SUMS)
-git -C "$runtime_dir" apply --whitespace=error-all --check "$component_dir/patches/head-bmi088.patch"
+# 后续补丁可能修改前一补丁刚改过的行；在临时索引中按顺序验证，不写入 checkout。
+validation_dir="$(mktemp -d)"
+trap 'rm -rf -- "$validation_dir"' EXIT
+export GIT_INDEX_FILE="$validation_dir/index"
+git -C "$runtime_dir" read-tree HEAD
+for patch in "${patches[@]}"; do
+    # 临时索引不感知未跟踪文件；显式拒绝这些路径上的文件和符号链接。
+    while IFS=$'\t' read -r added removed target; do
+        if ! git -C "$runtime_dir" ls-files --error-unmatch -- "$target" >/dev/null 2>&1 \
+            && [[ -e "$runtime_dir/$target" || -L "$runtime_dir/$target" ]]; then
+            echo "新增补丁目标已存在：$target" >&2
+            exit 1
+        fi
+    done < <(git -C "$runtime_dir" apply --numstat "$patch")
+    git -C "$runtime_dir" apply --cached --whitespace=error-all "$patch"
+done
+unset GIT_INDEX_FILE
 if [[ "$operation" == '--apply' ]]; then
-    git -C "$runtime_dir" apply "$component_dir/patches/head-bmi088.patch"
-    echo '已应用本地源码补丁；尚未构建、部署或启用运动。'
+    for patch in "${patches[@]}"; do
+        git -C "$runtime_dir" apply --whitespace=error-all "$patch"
+    done
+    echo '已应用头部接入与原生修复补丁；尚未构建、部署或启用运动。'
 else
     echo '补丁可应用；未修改运行时。'
 fi

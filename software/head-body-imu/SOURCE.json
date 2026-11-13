@@ -6,7 +6,16 @@
     "patch": "patches/head-bmi088.patch",
     "tracked_modified_files": 11,
     "new_files": 3,
-    "license": "Apache-2.0; patches/LICENSE.runtime"
+    "license": "Apache-2.0; patches/LICENSE.runtime",
+    "follow_up_patches": [
+      {
+        "path": "patches/runtime-hardening.patch",
+        "tracked_modified_files": 9,
+        "new_files": 1,
+        "purpose": "idempotent immutable deployment defaults, startup report priority, isolated native regression fixtures"
+      }
+    ],
+    "diagnostic_build": "replica-imu-verify-control.48-head-bmi088.2"
   },
   "model": {
     "repository": "https://github.com/fanhao375/Microduck-kissqy",
