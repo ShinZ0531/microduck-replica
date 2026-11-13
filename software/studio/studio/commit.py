@@ -47,8 +47,8 @@ LIMITS_DEG = {
     "right_hip_yaw": (-30.0, 25.0), "right_hip_roll": (-22.0, 22.0), "right_hip_pitch": (-90.0, 90.0),
     "right_knee": (-90.0, 90.0), "right_ankle": (-70.0, 70.0),
 }
-IMU_SOURCES = ("bus", "bno08x", "lsm6dsv16x")
-CHIP_CN = {"bus": "总线小板（ID 200）", "bno08x": "BNO085（I²C）", "lsm6dsv16x": "LSM6DSV16X（I²C）"}
+IMU_SOURCES = ("bus", "bno08x", "lsm6dsv16x", "head_bmi088")
+CHIP_CN = {"head_bmi088": "头部 BMI088（关节补偿）", "bus": "总线小板（ID 200）", "bno08x": "BNO085（I²C）", "lsm6dsv16x": "LSM6DSV16X（I²C）"}
 DEFAULT_BUS_QUAT = [math.sqrt(0.5), 0.0, math.sqrt(0.5), 0.0]     # fork imu.rs: SflpDecoder::DEFAULT_MOUNT
 # 第 2 步标了已完成 / 跳过、主程序里方向没确认、IMU 页也没校过时，第 3 步按这些「默认装法」写（任务 17，用户 10-21：
 # 「我一直跳过跳过，最后还是不进运动模式」）。总线小板用文件里现有的 imu_mount_quat（出厂就是上面的官方装法）
@@ -183,7 +183,7 @@ def build_calibration(current, joints, imu):
 
     raw_mounts = current.get("imu_mounts")
     if isinstance(raw_mounts, dict):
-        for kind in ("bno08x", "lsm6dsv16x"):
+        for kind in ("bno08x", "lsm6dsv16x", "head_bmi088"):
             mount = raw_mounts.get(kind)
             if mount is None:
                 continue
@@ -196,13 +196,64 @@ def build_calibration(current, joints, imu):
         raise CalibError("imu 要是一个对象")
     source = imu.get("source")
     if source not in IMU_SOURCES:
-        raise CalibError(f"imu.source 只能是 bus / bno08x / lsm6dsv16x，现在是 {source!r}")
+        raise CalibError(f"imu.source 只能是 bus / bno08x / lsm6dsv16x / head_bmi088，现在是 {source!r}")
     quat = normalize_quat(imu.get("quat"))
+    if source == "head_bmi088":
+        stored = out["imu_mounts"].get(source) or {}
+        if stored.get("verified") is not True or not head_quat_matches(stored.get("quat"), quat):
+            raise CalibError("头部 BMI088 必须先由主程序完成专用核验，不能直接写入任意方向")
+        quat = list(stored["quat"])
+        for row, original in zip(out["joints"], (by_name[name] for name in JOINT_ORDER)):
+            if row["direction"] != original.get("direction"):
+                raise CalibError("头部核验后关节方向已改变，请先同步方向并重新核验")
+            # 保留用户完成的真实零位、方向及限位；不套用出厂 2048 或通用限位覆盖。
+            for key in ("zero_raw", "direction"):
+                row[key] = original.get(key)
+            for key in ("min_rad", "max_rad"):
+                if original.get(key) is not None:
+                    row[key] = original[key]
     if source == "bus":
         out["imu_mount_quat"], out["imu_mount_verified"] = quat, True
     else:
         out["imu_mounts"][source] = {"quat": quat, "verified": True}
     return out
+
+
+def head_quat_matches(left, right):
+    """仅容忍序列化单位化误差和四元数等价符号；不接受另一种安装方向。"""
+    try:
+        a, b = normalize_quat(left), normalize_quat(right)
+    except CalibError:
+        return False
+    return any(all(math.isclose(x, sign * y, rel_tol=0.0, abs_tol=1e-8) for x, y in zip(a, b))
+               for sign in (1.0, -1.0))
+
+
+def require_head_proof(calibration, proof, quat):
+    """核对原生十步报告与当前安装及头部几何；页面确认和旧 pending 不能充当实测证据。"""
+    if not isinstance(proof, dict) or proof.get("contract") != "head_mount_fixed_torso_v1":
+        raise CalibError("头部 BMI088 还未完成专用安装核验：去 IMU 页按步骤采集并保存")
+    mount = (calibration.get("imu_mounts") or {}).get("head_bmi088") or {}
+    expected = {"model_sha256": "078693dff3bcd5e69eb6cc483974178e1511a11f762b1a4dd00370bc5d58b8a8",
+                "joints": [{key: row.get(key) for key in ("id", "name", "zero_raw", "direction")}
+                           for row in calibration.get("joints", []) if row.get("id") in (30, 31, 32, 33)]}
+    reports = proof.get("reports")
+    if (mount.get("verified") is not True or not head_quat_matches(mount.get("quat"), quat)
+            or not head_quat_matches(proof.get("mount"), quat)
+            or proof.get("source") != "head_bmi088" or proof.get("binding") != expected
+            or len(expected["joints"]) != 4 or not isinstance(reports, list) or len(reports) != 10):
+        raise CalibError("头部核验报告与当前安装、关节零位或方向不一致，请重新核验")
+    for index, report in enumerate(reports):
+        if (not isinstance(report, dict) or type(report.get("step")) is not int or report["step"] != index
+                or type(report.get("sample_count")) is not int or report["sample_count"] < 60
+                or not _is_num(report.get("sample_span_s")) or report["sample_span_s"] < 1.5):
+            raise CalibError("头部核验报告缺少有效的独立采样证据")
+        if 4 <= index <= 7:
+            limits = (("max_body_error_deg", 0.0, 5.0), ("body_gyro_rms_rad_s", 0.0, 0.15),
+                      ("body_gyro_peak_rad_s", 0.0, 0.5), ("head_span_deg", 8.0, 360.0))
+            if any(not _is_num(report.get(key)) or not low <= report[key] <= high for key, low, high in limits):
+                raise CalibError("头部运动补偿实测误差未达到核验条件")
+    return proof
 
 
 def _raw_position(zero_raw, radians, direction):
@@ -236,10 +287,10 @@ def validate_calibration(cal, source=None):
     bus_q = _quat(cal.get("imu_mount_quat"), "imu_mount_quat")
     mounts = cal.get("imu_mounts")
     mounts = mounts if isinstance(mounts, dict) else {}
-    if set(mounts) - {"bno08x", "lsm6dsv16x"}:
-        raise CalibError(f"imu_mounts 里有不认识的来源：{sorted(set(mounts) - {'bno08x', 'lsm6dsv16x'})}")
+    if set(mounts) - {"bno08x", "lsm6dsv16x", "head_bmi088"}:
+        raise CalibError(f"imu_mounts 里有不认识的来源：{sorted(set(mounts) - {'bno08x', 'lsm6dsv16x', 'head_bmi088'})}")
     checked = [("总线小板", bus_q)]
-    for kind in ("bno08x", "lsm6dsv16x"):
+    for kind in ("bno08x", "lsm6dsv16x", "head_bmi088"):
         mount = mounts.get(kind)
         if mount is None:
             continue
@@ -301,7 +352,7 @@ def validate_calibration(cal, source=None):
     if cal.get("motion_enabled"):
         if any(not j.get("calibrated") or j.get("min_rad") is None or j.get("max_rad") is None for j in joints):
             raise CalibError("motion_enabled = true 时 15 颗都要 calibrated 且有限位")
-        if source in ("bno08x", "lsm6dsv16x"):
+        if source in ("bno08x", "lsm6dsv16x", "head_bmi088"):
             mount = mounts.get(source) or {}
             verified = bool(mount.get("verified")) if isinstance(mount, dict) else False
             label = CHIP_CN[source]
@@ -317,7 +368,7 @@ def validate_calibration(cal, source=None):
 
 
 def render_calibration(cal):
-    """自己写 TOML：顶层键 → [imu_mounts.*] → [[joints]]。写完要再用 tomllib 读回来核对。"""
+    """写出所有已知来源（含头部安装）与关节；写后须用 tomllib 核对，不丢弃原有安装槽。"""
     lines = [
         f"motion_enabled = {_bool_text(cal.get('motion_enabled'))}",
         f"imu_mount_verified = {_bool_text(cal.get('imu_mount_verified'))}",
@@ -334,7 +385,7 @@ def render_calibration(cal):
             raise CalibError("imu_bus_profile 只能是 legacy 或 qinmo")
         lines.append(f'imu_bus_profile = "{cal["imu_bus_profile"]}"')
     mounts = cal.get("imu_mounts") or {}
-    for kind in ("bno08x", "lsm6dsv16x"):
+    for kind in ("bno08x", "lsm6dsv16x", "head_bmi088"):
         mount = mounts.get(kind)
         if mount is None:
             continue
@@ -437,6 +488,8 @@ def load_centered(state_dir):
 
 def save_pending(state_dir, source, quat, quality=None, by=None, at=None, *, imu_bus=None):
     """IMU 页站着完整校完、结果 ok 的那一份：Studio 重启也不丢。"""
+    if source == "head_bmi088":
+        raise Refused("头部 BMI088 请使用专用核验，不能保存固定躯干校准结果")
     if source not in IMU_SOURCES:
         raise Refused(f"不认识的 IMU 来源：{source!r}")
     row = {"at": time.time() if at is None else at, "by": by, "source": source,
@@ -448,8 +501,10 @@ def save_pending(state_dir, source, quat, quality=None, by=None, at=None, *, imu
 
 
 def load_pending(state_dir):
+    """读取固定躯干校准暂存；头部来源必须读取主控专用报告，不能借用旧 pending。"""
     row = _read_json(_path(state_dir, IMU_PENDING))
-    if not isinstance(row, dict) or row.get("source") not in IMU_SOURCES:
+    if (not isinstance(row, dict) or row.get("source") not in IMU_SOURCES
+            or row.get("source") == "head_bmi088"):
         return None
     try:
         q = normalize_quat(row.get("quat"))
@@ -647,7 +702,8 @@ class CommitService:
         """第 2 步标了「已完成」/「跳过」、主程序里正在用的那颗 IMU 方向没确认、也没有 imu-pending.json：
         按默认装法写这颗、标成已确认（任务 17）。回 {source, quat, label, how, mark}；不该用默认的回 None。
         有 pending（站着校过）照旧用 pending；方向已确认照旧用主程序的；芯片不知道的不猜。"""
-        if self.pending or source not in IMU_SOURCES or (mount or {}).get("verified") is True:
+        if (self.pending or source not in IMU_SOURCES or source == "head_bmi088"
+                or (mount or {}).get("verified") is True):
             return None
         if source == "bus" and (cal or {}).get("imu_bus_profile") == "qinmo":
             return None
@@ -667,6 +723,7 @@ class CommitService:
         return {"source": source, "quat": quat, "label": CHIP_CN[source], "how": DEFAULT_HOW[source], "mark": mark}
 
     def readiness(self, rd=None, servo=None):
+        """汇总实际回读和准备条件；头部来源另外要求匹配当前几何的原生十步报告。"""
         from .estop import STARTING_LONG_S, STARTING_PHASES
         from .imu import bus_protocol_mismatch, mount_of
         from .state import JOINT_CN, STILL_STARTING, starting_secs
@@ -800,6 +857,13 @@ class CommitService:
             imu_ok, imu_text = False, "标定模式：先在 IMU 页粗校一次，交给主程序验证"
         else:
             imu_ok, imu_text = False, "还没在 IMU 页校过安装方向"
+        if source == "head_bmi088":
+            try:
+                require_head_proof(cal, (calib or {}).get("head_imu_verification"), mount.get("quat"))
+                if bus.get("imu_verification"):
+                    raise CalibError("头部校验会话尚未结束，请完成保存或取消后再写进主程序")
+            except CalibError as error:
+                imu_ok, imu_text = False, str(error)
         imu_mark = self._user_mark("imu")
         imu_default = None
         if not imu_ok and imu_mark and not protocol_changed:

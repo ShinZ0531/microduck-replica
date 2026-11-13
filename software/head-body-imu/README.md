@@ -1,4 +1,4 @@
-# 头部 BMI088 躯干姿态诊断
+# 头部 BMI088 躯干姿态与安装核验
 
 本模块将旧工程中的头部补偿核心和原生接入增量整理为可追溯源码。
 输入是头部 BMI088 的源时间、四元数、角速度，以及 ID 30/31/32/33 的实际关节反馈。
@@ -47,11 +47,13 @@ bash software/head-body-imu/scripts/prepare-runtime.sh /path/to/runtime --apply
 ```
 
 脚本不下载、不编译、不连接鸭子；拒绝基线不符或已跟踪文件未提交的 checkout，
-临时索引按顺序验证两个补丁，也会拒绝覆盖新增目标文件。
+临时索引按顺序验证三个补丁，也会拒绝覆盖新增目标文件。
 `head-bmi088.patch` 包括 11 个原有文件的修改与 3 个新增 Rust 文件；
 `runtime-hardening.patch` 在此基础上修改 9 个已有文件，另加一个仅用于测试的起身配置。
 后一补丁使相同 HOME/P 部署参数可重复初始化，但仍拒绝更换已经采用的参数，
 并修正启动阶段显示及过期测试假设，不改变实际设备的零位或按键配置。
+`head-calibration.patch` 再修改 6 个原有文件、新增 1 个 Rust 绑定文件，实现本文下述专用流程；
+本地控制器扩展为 `control.48-head-bmi088.3`、API 44，不是 RC4 升级。
 原生仓库的 Apache-2.0 许可保存在 `patches/LICENSE.runtime`。
 
 应用后按原生仓库 `CONTRIBUTING.md` 的工具链构建。该基线要求 Rust 1.99+，
@@ -67,15 +69,12 @@ bash software/head-body-imu/scripts/verify-native.sh /path/to/runtime /path/to/s
 `packaging/models` 和 `packaging/roller` 中的 11 份原始 `policy.onnx` 均按各自 manifest 核对摘要。
 脚本不自动下载、安装依赖或向主机 `/opt` 写文件；基线和候选必须使用不同构建目录。
 
-2026-11-13 已通过 C++ 1693 个断言，以及 `duck-control`、`robotd`、`robotd-params`
-和相关集成目标的 775 项 Rust 测试。默认 ignored 的动态 ABI、循环网络、
+2026-11-13 的 `.3` 候选已通过 C++ 原估计器 1693 与新校验器 6554 个断言，
+以及选定原生目标的 780 项唯一 Rust 测试。默认 ignored 的动态 ABI、循环网络、
 ONNX 推理和三项模式切换测试均显式执行。三项模式切换用例在隔离目录布局中使用
 明确的常量网络替身，只验证状态机；其他真实动作模型用例仍使用核验过的原始模型。
-这些结果不代表真实机器人动作或策略效果已经通过验收。
-
-ARM64 主控诊断版 `replica-imu-verify-control.48-head-bmi088.2` 已通过 SSH 部署并完成只读采样，
-仍以 `--commissioning` 启动，舵机保持断力；原 C++ 库和设备配置保持原值。
-构建、部署和实测边界见[整合与上机验证记录](../../docs/head-imu-integration-20261113.md)。
+Python 回归和模拟网页完整十步流程也通过。这些结果不代表实物安装或走路已通过。
+历史部署与实物验收边界见[整合记录](../../docs/head-imu-integration-20261113.md)。
 
 ## 与 Studio 的关系
 
@@ -86,11 +85,14 @@ Studio 的 IMU 页新增原始 HAT 卡片；`/api/head-imu` 复用 tofd 只读�
 不迁移旧 `/api/body-imu-preview`：它依赖 Studio 自己接管舵机总线，
 不作为 robotd 控制时的数据来源。C++ 计算只在原生控制器接入层执行。
 
-## 后续验证
+## 专用安装核验与下一步
 
-- 设备快照、双份备份、Studio 部署与网页实测、选定原生目标回归和主控诊断版切换已完成。
-- 固定躯干，验证传感器到头部模型的安装变换和头颈关节方向；再验证身体倾斜时的方向与时效。
-- 完成专用校准保存及控制条件检查后，另行进行坐站、碰撞与行走验收。
+Studio 在 `head_bmi088` 来源下显示独立十步向导：三姿态求安装、独立摆正复核、
+逐个手动转动 ID 30–33、整机前倾和左倾复核。全程断力、承托机身及头颈。
+采样由主控读取真实 HAT 和编码器反馈，C++ 计算安装及残差；页面不能上传替代测量。
+十步通过后仍需单独保存，保留机械零位及关节方向，运动开关仍关闭。
+随后回上手清单预览并明确提交，由受保护 helper 复核报告、重启并回读运动模式；失败回退。
 
-`motionAuthorized` 恒为 0；保留原生 `verify-imu` 对 `head_bmi088` 的拒绝，
-不伪造校准通过，不应用历史 EEPROM 偏移，也不移除板上的诊断模式覆盖。
+操作步骤、门限、报告绑定和失效条件见[专用校验说明](../../docs/head-imu-calibration-20261113.md)。
+`motionAuthorized` 恒为 0；原生固定躯干 `verify-imu` 继续拒绝头部来源。
+后续坐站、蜷缩碰撞和行走都需要独立的实物验收。

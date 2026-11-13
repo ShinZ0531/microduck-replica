@@ -152,11 +152,13 @@ def mount_of(bus, calib):
 
 class ImuBackend:
     def __init__(self, robotd, log, state_dir=".", root="/"):
+        """绑定现有主控、日志及状态目录；原生主控持有头部采样和保存权限。"""
         self.rd, self.log, self.state_dir = robotd, log, state_dir
         self.root = root
         self._seen_context = None
         self._context_generation = 0
         self._redo_busy = False
+        self._head_active = False
         self._capture_basis = None
         self._result_basis = None
         self._verify_lock = asyncio.Lock()
@@ -206,6 +208,7 @@ class ImuBackend:
         return {
             "t": "imu", "mode": bus.get("mode"), "source": source, "chip_setting": None, "mount": mount,
             "diagnostic": imu_diagnostic(self.rd),
+            "head_verification": (calib or {}).get("head_imu_verification"),
             "imu_bus": bus_imu_of(bus) if source == "bus" else None,
             "configured_imu_profile": configured_profile(bus),
             "profile_error": bus_profile_error(bus, calib, source),
@@ -313,7 +316,8 @@ class ImuBackend:
         return {"can_start": reason is None, "reason": reason}
 
     def blocks_updates(self):
-        return self._redo_busy or helper.imu_redo_state(root=self.root).get("active", False)
+        """头部或原有标定会话未结束时，拒绝并行更新及手柄重映射。"""
+        return self._head_active or self._redo_busy or helper.imu_redo_state(root=self.root).get("active", False)
 
     def _coarse_guard(self, bus):
         if self._redo_busy:
@@ -782,8 +786,58 @@ class ImuBackend:
             self.rd.calib.set(status)
         return status
 
+    async def _head_op(self, args, by=None):
+        """转交头部专用步骤，不接收页面测量或安装四元数；保存后独立读回原生证据。"""
+        operations = {"head-start": "start", "head-status": "status", "head-capture": "capture",
+                      "head-save": "save", "head-cancel": "cancel"}
+        operation = operations.get(args.get("op"))
+        if operation is None or set(args) - {"op", "step", "confirmed"}:
+            raise Refused("头部校验只接受步骤操作，不能上传测量、四元数或通过标志")
+        step = args.get("step", 0)
+        if type(step) is not int or not 0 <= step <= 10:
+            raise Refused("头部核验步骤无效")
+        if operation != "status" and args.get("confirmed") is not True:
+            raise Refused("请先按当前步骤扶稳机身或头部并明确确认")
+        bus = await self._bus_once()
+        source, _ = mount_of(bus, fresh_calib(self.rd))
+        if source != "head_bmi088":
+            raise Refused("当前主程序没有使用头部 BMI088")
+        if bus.get("mode") != "commissioning":
+            if operation == "status":
+                return {"active": False, "mode": bus.get("mode"),
+                        "saved": bool((fresh_calib(self.rd) or {}).get("head_imu_verification"))}
+            raise Refused("头部专用核验在标定模式下进行；先扶稳并卸力，由维护者切回标定模式")
+        async with self._verify_lock:
+            try:
+                result = await self._rpc_once("robot.busCommand",
+                    {"action": "head-imu-calibration", "operation": operation, "step": step,
+                     "confirmed": args.get("confirmed") is True}, 8.0, "头部 IMU 专用校验")
+            except (RpcError, Timeout, Unreachable) as error:
+                raise Refused(getattr(error, "message", None) or str(error)) from error
+            self._head_active = result.get("active") is True
+            if result.get("saved"):
+                reply = result.get("calibration") or {}
+                mount = (reply.get("imu_mount") or {}).get("quat")
+                status = await self._verified_readback(source, mount)
+                from .commit import CalibError, require_head_proof
+                try:
+                    require_head_proof(status["calibration"], status.get("head_imu_verification"), mount)
+                except (CalibError, KeyError) as error:
+                    raise Refused("主程序保存后的头部核验报告未准确读回：" + str(error)) from error
+                self.log.info("头部 IMU 十步安装核验已保存；零位及运动许可未改变", cat="IMU",
+                              ctx={"by": by, "source": source})
+            return result
+
     async def handle(self, args, by=None):
+        """分派现有固定躯干流程和独立头部流程；禁止两类校准语义混用。"""
         op = args.get("op")
+        if isinstance(op, str) and op.startswith("head-"):
+            if self._verify_lock.locked():
+                raise Refused("当前头部校验请求尚未结束，请稍候")
+            return await self._head_op(args, by)
+        if self.view().get("source") == "head_bmi088" and op in (
+                "solve", "coarse-capture", "verify", "hold", "redo-start", "profile-select"):
+            raise Refused("头部 BMI088 请使用专用核验卡片，不能使用固定躯干粗校或站姿使能")
         if self._verify_lock.locked():
             raise Refused("安装方向正在验证：等当前操作结束，紧急时仍可卸力")
         if (op in ("coarse-capture", "solve", "verify", "redo-start", "profile-select")

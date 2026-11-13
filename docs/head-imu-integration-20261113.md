@@ -209,3 +209,70 @@ sudo sh /var/backups/microduck/20261113-head-imu-native-v2/rollback-native.sh
 
 下一步是设计头部安装及关节方向的实物核验，再单独安排真实姿态和动作测试。
 固定躯干的 `verify-imu` 拒绝逻辑继续保留，不能以移除它代替头部安装验证。
+
+## 第三阶段：专用安装核验闭环（2026-11-13）
+
+新增 `head-calibration.patch`，在前两个补丁之上构成 `.3` 本地控制器（API 44）。
+主控真实取样、C++ 求安装及残差、原生报告绑定、Studio 十步向导和上手清单提交闭环已实现。
+具体操作、门限和仍需实物验证的限制见[专用说明](head-imu-calibration-20261113.md)。
+
+### 源码及本地验证
+
+- 三个补丁顺序重建的 24 个原生文件与测试构建树逐字节一致。
+- C++ 原估计器 1693、新校验器 6554 个断言通过；冻结模型的独立 MuJoCo 夹具保留。
+- Rust 共 780 项唯一用例：duck-control 302 常规 + 3 显式 ignored，循环网络 8，
+  robotd 331 常规 + 2 ONNX + 3 隔离模式切换，single_instance/updater_gate 11 + 7，robotd-params 113。
+- 原提交/helper 78、原 IMU 等 192、原 wizard 12、新头部 8 项 Python 测试通过；
+  上述套件有重复组合执行，不把重复执行次数计作新增测试数量。
+- 本地统一入口另跑 35 项 Python 和 2 项 JS 检查通过。
+- 隔离 Chrome 模拟十步流程包含失败留步、禁止自动保存、单独保存、离页停止轮询及手机宽度检查。
+- 按根规范补齐本次修改的方法用途说明，新 C++ 文件通过所附 clang-format 配置检查；
+  最后两处格式调整后重建库，所有运行时加载 ELF 节与调整前逐字节相同，仅调试行号节不同。
+
+### 板端部署与只读验收
+
+已通过 SSH 安装到独立本地组件目录，不重新烧卡，不切换托管发布软链接：
+
+| 项目 | 最终值 |
+| --- | --- |
+| 主控 | `/opt/microduck/local-components/head-body-v3/robotd-head-bmi088.3` |
+| 主控 SHA256 | `d2b6b3683d39c9c2a952f6f373676b3a9f2ff64742e7afc9bc84835932f159cf` |
+| C++ 库 | `/opt/microduck/local-components/head-body-v3/libmicroduck_head_body.so` |
+| 最终库 SHA256 | `06b572547feea279e072cfee6b74209281e5a4af34bad9b450cd8cb0fd17c85c` |
+| Studio | `2026.11.13-head-imu.2`，`/opt/microduck/local-components/studio-head-calibration-v3` |
+| 最终 Studio 包 SHA256 | `f2ea22b2b312b8e52d4ca7197b99ef07b482138b80166bc7266d399ed049ccec` |
+| 原设备备份 SHA256 | `336f18b0e8f107ac60b6efb8aa1006621edc16f323f0e0500048952b75e4cd84` |
+
+先备份全部 `/etc/robot`、原组件、主控与 Studio 服务/覆盖、helper 以及 Studio 状态，
+再持有服务管理锁切换。保留 `--commissioning`；设备配置只改变 `trunk_imu.head_estimator_library`。
+舵机零位、方向、限位、校准完成标志和安装未核验状态均保留；校准文件摘要前后同为
+`62d52690cb9950451db909e5cac033b6a7c60b479086c56b04c143b9fbec0871`。
+
+板端动态库加载正常；不访问硬件的两组 C++ 测试也分别通过 1693/6554 个断言。
+切换后的 50 次主控只读采样均保持十五颗反馈、断力、头部来源新鲜：
+cycle 增加 251，IMU 序号增加 249，最大年龄 19.60 ms，约 49.99 Hz。
+API 回读 44，专用会话 inactive，未保存报告符合当前实物尚未校验的状态。
+传感器 tofd 和手柄 padd 运行实例未变。
+
+实际 Studio 使用已授权网页登录完成验收：专用向导可见、源序号持续增加、约 49.6 Hz、
+无未捕获网页异常、手机宽度无横向溢出，离开 IMU 页后停止 HAT 轮询。
+最后仅注释及格式同步后再次重启；再次检查 370 个 Studio 文件全部匹配摘要。
+另采 50 帧只读快照：cycle +259、IMU 序号 +256、最大年龄 20.80 ms、约 50.00 Hz；
+主控与 Studio 均 active，自动重启计数为 0。
+
+**本次没有开始真实核验、保存安装结果、提交运动许可、使能电机或执行任何动作。**
+需要用户重新加载 IMU 页面，承托机身和头颈，逐步采集并明确保存。
+新安装方向的正确性、头部运动补偿精度和后续走路仍待现场验收。
+
+备份在板端 `/var/backups/microduck/20261113-head-imu-calibration-v3/`，
+本机第二份及原始日志分别在 `microduck env/device-backups/20261113-head-imu-calibration-v3/`
+和 `microduck env/device-validation/20261113-head-imu-calibration-v3/`；均不纳入 Git。
+回退入口：
+
+```bash
+sudo sh /var/backups/microduck/20261113-head-imu-calibration-v3/rollback-calibration.sh
+```
+
+回退会核对本次覆盖与全部设备配置的最终摘要，并要求仍处于断力标定状态。
+用户随后保存核验或改配置后，脚本会拒绝自动回退，防止覆盖新成果。
+该入口已静态检查，未为演示回退而切换正常服务。

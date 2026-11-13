@@ -74,6 +74,10 @@ int microduck_estimate_body(const struct MicroduckHeadInput* input, struct Micro
 int microduck_estimate_encoders(const struct MicroduckHeadInput* sensorInput,
     const struct MicroduckEncoderPair* encoders, struct MicroduckBodyEstimate* output);
 
+/** 对齐两帧编码器，输出供现有估计器及校准器共用的输入；失败输出不得使用。 */
+int microduck_align_encoders(const struct MicroduckHeadInput* sensorInput,
+    const struct MicroduckEncoderPair* encoders, struct MicroduckHeadInput* aligned);
+
 #ifdef __cplusplus
 }
 #endif

@@ -287,31 +287,28 @@ int microduck_estimate_body(const MicroduckHeadInput* input, MicroduckBodyEstima
     return output->status;
 }
 
-/** 对齐实际编码器与 IMU 源时间；只插值，不外推。 */
-int microduck_estimate_encoders(const MicroduckHeadInput* sensorInput,
-    const MicroduckEncoderPair* encoders, MicroduckBodyEstimate* output)
+/** 对齐实际编码器与 IMU 源时间；供估计和安装核验共用，不外推。 */
+int microduck_align_encoders(const MicroduckHeadInput* sensorInput,
+    const MicroduckEncoderPair* encoders, MicroduckHeadInput* destination)
 {
-    if (output == nullptr)
+    if (destination == nullptr)
     {
         return MICRODUCK_ESTIMATE_INVALID;
     }
-    clearEstimate(*output);
     if (sensorInput == nullptr || encoders == nullptr || encoders->previousNs == 0
         || encoders->currentNs <= encoders->previousNs || encoders->currentNs > sensorInput->nowNs)
     {
-        return output->status;
+        return MICRODUCK_ESTIMATE_INVALID;
     }
     const unsigned long long intervalNs = encoders->currentNs - encoders->previousNs;
     if (intervalNs < 5000000 || intervalNs > 40000000
         || sensorInput->imuSampleNs < encoders->previousNs || sensorInput->imuSampleNs > encoders->currentNs)
     {
-        output->status = MICRODUCK_ESTIMATE_UNSYNCHRONIZED;
-        return output->status;
+        return MICRODUCK_ESTIMATE_UNSYNCHRONIZED;
     }
     if (sensorInput->nowNs - encoders->previousNs > kMaximumAgeNs)
     {
-        output->status = MICRODUCK_ESTIMATE_STALE;
-        return output->status;
+        return MICRODUCK_ESTIMATE_STALE;
     }
     MicroduckHeadInput aligned = *sensorInput;
     aligned.jointSampleNs = sensorInput->imuSampleNs;
@@ -326,13 +323,33 @@ int microduck_estimate_encoders(const MicroduckHeadInput* sensorInput,
             || encoders->currentRaw[joint] < 0 || encoders->currentRaw[joint] > 4095
             || encoders->zeroRaw[joint] < 0 || encoders->zeroRaw[joint] > 4095)
         {
-            return output->status;
+            return MICRODUCK_ESTIMATE_INVALID;
         }
         const double differenceCounts = encoders->currentRaw[joint] - encoders->previousRaw[joint];
         const double positionCounts = encoders->previousRaw[joint] + fraction * differenceCounts;
         const double scale = encoders->direction[joint] * kRadiansPerCount;
         aligned.jointAnglesRad[joint] = (positionCounts - encoders->zeroRaw[joint]) * scale;
         aligned.jointVelocityRadS[joint] = differenceCounts * scale / intervalSeconds;
+    }
+    *destination = aligned;
+    return MICRODUCK_ESTIMATE_OK;
+}
+
+/** 对齐后调用原有估计器；对外保留 ABI v1 的失败 NaN 和诊断授权语义。 */
+int microduck_estimate_encoders(const MicroduckHeadInput* sensorInput,
+    const MicroduckEncoderPair* encoders, MicroduckBodyEstimate* output)
+{
+    if (output == nullptr)
+    {
+        return MICRODUCK_ESTIMATE_INVALID;
+    }
+    clearEstimate(*output);
+    MicroduckHeadInput aligned;
+    const int status = microduck_align_encoders(sensorInput, encoders, &aligned);
+    if (status != MICRODUCK_ESTIMATE_OK)
+    {
+        output->status = status;
+        return status;
     }
     return microduck_estimate_body(&aligned, output);
 }

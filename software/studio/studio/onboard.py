@@ -385,11 +385,22 @@ def servo_row(inp, rec, head):
 
 
 def imu_row(inp, rec, head):
+    """固定躯干沿用原核对记录；头部来源只以主控绑定当前安装的十步报告判完成。"""
     bus = inp.get("bus") or {}
     calib = inp.get("calib")
     if head["kind"] in ("absent", "connecting", "bench"):
         return _row("imu", "unk", "连上主程序才判得出", actions=[("imu", "去 IMU 页")])
     source, mount = mount_of(bus, calib)
+    if source == "head_bmi088":
+        from .commit import CalibError, require_head_proof
+        cal = (calib or {}).get("calibration") or {}
+        try:
+            require_head_proof(cal, (calib or {}).get("head_imu_verification"), (mount or {}).get("quat"))
+            if bus.get("imu_verification"):
+                return _row("imu", "todo", "头部安装核验会话尚未结束", actions=[("imu", "去 IMU 页")])
+            return _row("imu", "ok", "头部 BMI088 安装与四个头颈关节补偿已通过主控十步核验")
+        except CalibError as error:
+            return _row("imu", "no", str(error), actions=[("imu", "去 IMU 页")], hard=HARD_IMU)
     # stuck_calib 不在这里拦：主程序明说 IMU 没确认由下面两个 HARD_IMU 分支拦，否则照正常逻辑判（能跳过）
     if head["kind"] == "commissioning" and bus.get("imu_mount_verified") is False:
         return _row("imu", "no", "标定模式下主程序说 IMU 方向没确认", actions=[("imu", "去 IMU 页")], hard=HARD_IMU)

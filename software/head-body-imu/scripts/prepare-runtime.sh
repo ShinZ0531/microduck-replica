@@ -9,6 +9,7 @@ base_commit='eecac1878136d3188370a5f6460b7d0521cf845d'
 patches=(
     "$component_dir/patches/head-bmi088.patch"
     "$component_dir/patches/runtime-hardening.patch"
+    "$component_dir/patches/head-calibration.patch"
 )
 
 if [[ $# -lt 1 || $# -gt 2 || ! -d "$runtime_dir" ]]; then
@@ -57,7 +58,7 @@ if [[ "$operation" == '--apply' ]]; then
     for patch in "${patches[@]}"; do
         git -C "$runtime_dir" apply --whitespace=error-all "$patch"
     done
-    echo '已应用头部接入与原生修复补丁；尚未构建、部署或启用运动。'
+    echo '已应用头部接入、原生修复及专用校验补丁；尚未构建、部署或启用运动。'
 else
     echo '补丁可应用；未修改运行时。'
 fi

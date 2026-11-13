@@ -105,6 +105,13 @@ CALIB_SAVED = "/etc/robot/feetech-ft5/hd1910-calibration.saved.toml"
 CALIB_PREVIOUS = "/etc/robot/feetech-ft5/hd1910-calibration.previous.toml"
 CALIB_BACKUP_DIR = OPLOG_DIR + "/calib-backups"
 COMMISSIONING_DROPIN = "/etc/systemd/system/robotd.service.d/zzzz-zz-microduck-commissioning.conf"
+HEAD_DIAGNOSTIC_DROPIN = "/etc/systemd/system/robotd.service.d/zzzzzz-head-bmi088-diagnostic.conf"
+HEAD_PROOF = "/etc/robot/feetech-ft5/hd1910-calibration.head-imu-proof.json"
+HEAD_START = ("/opt/microduck/local-components/head-body-v3/robotd-head-bmi088.3 "
+              "--socket /run/robotd.sock --params /etc/robot/feetech-ft5/robotd.toml --port /dev/ttyS2")
+HEAD_OVERRIDE_PREFIX = ("# Head BMI088 diagnostic build; keep commissioning until physical mounting is verified.\n"
+                        "[Service]\nExecStart=\nExecStart=")
+
 IMU_REDO_DIR = OPLOG_DIR + "/imu-recalibrate"
 IMU_REDO_MANIFEST = IMU_REDO_DIR + "/manifest.json"
 IMU_REDO_DROPIN = "/etc/systemd/system/robotd.service.d/zzzzzz-studio-imu-recalibrate.conf"
@@ -696,8 +703,8 @@ LIMITS_DEG = {
     "right_hip_yaw": (-30.0, 25.0), "right_hip_roll": (-22.0, 22.0), "right_hip_pitch": (-90.0, 90.0),
     "right_knee": (-90.0, 90.0), "right_ankle": (-70.0, 70.0),
 }
-IMU_SOURCES = ("bus", "bno08x", "lsm6dsv16x")
-CHIP_CN = {"bus": "总线小板（ID 200）", "bno08x": "BNO085（I²C）", "lsm6dsv16x": "LSM6DSV16X（I²C）"}
+IMU_SOURCES = ("bus", "bno08x", "lsm6dsv16x", "head_bmi088")
+CHIP_CN = {"head_bmi088": "头部 BMI088（关节补偿）", "bus": "总线小板（ID 200）", "bno08x": "BNO085（I²C）", "lsm6dsv16x": "LSM6DSV16X（I²C）"}
 DEFAULT_BUS_QUAT = [math.sqrt(0.5), 0.0, math.sqrt(0.5), 0.0]     # fork imu.rs: SflpDecoder::DEFAULT_MOUNT
 TOP_KEYS = ("motion_enabled", "imu_mount_verified", "imu_mount_quat", "imu_bus_protocol", "imu_bus_profile", "current_ma_per_count", "units_verified")
 TAU = 2.0 * math.pi
@@ -822,7 +829,7 @@ def build_calibration(current, joints, imu):
 
     raw_mounts = current.get("imu_mounts")
     if isinstance(raw_mounts, dict):
-        for kind in ("bno08x", "lsm6dsv16x"):
+        for kind in ("bno08x", "lsm6dsv16x", "head_bmi088"):
             mount = raw_mounts.get(kind)
             if mount is None:
                 continue
@@ -835,13 +842,64 @@ def build_calibration(current, joints, imu):
         raise CalibError("imu 要是一个对象")
     source = imu.get("source")
     if source not in IMU_SOURCES:
-        raise CalibError(f"imu.source 只能是 bus / bno08x / lsm6dsv16x，现在是 {source!r}")
+        raise CalibError(f"imu.source 只能是 bus / bno08x / lsm6dsv16x / head_bmi088，现在是 {source!r}")
     quat = normalize_quat(imu.get("quat"))
+    if source == "head_bmi088":
+        stored = out["imu_mounts"].get(source) or {}
+        if stored.get("verified") is not True or not head_quat_matches(stored.get("quat"), quat):
+            raise CalibError("头部 BMI088 必须先由主程序完成专用核验，不能直接写入任意方向")
+        quat = list(stored["quat"])
+        for row, original in zip(out["joints"], (by_name[name] for name in JOINT_ORDER)):
+            if row["direction"] != original.get("direction"):
+                raise CalibError("头部核验后关节方向已改变，请先同步方向并重新核验")
+            # 保留用户完成的真实零位、方向及限位；不套用出厂 2048 或通用限位覆盖。
+            for key in ("zero_raw", "direction"):
+                row[key] = original.get(key)
+            for key in ("min_rad", "max_rad"):
+                if original.get(key) is not None:
+                    row[key] = original[key]
     if source == "bus":
         out["imu_mount_quat"], out["imu_mount_verified"] = quat, True
     else:
         out["imu_mounts"][source] = {"quat": quat, "verified": True}
     return out
+
+
+def head_quat_matches(left, right):
+    """仅容忍序列化单位化误差和四元数等价符号；不接受另一种安装方向。"""
+    try:
+        a, b = normalize_quat(left), normalize_quat(right)
+    except CalibError:
+        return False
+    return any(all(math.isclose(x, sign * y, rel_tol=0.0, abs_tol=1e-8) for x, y in zip(a, b))
+               for sign in (1.0, -1.0))
+
+
+def require_head_proof(calibration, proof, quat):
+    """核对原生十步报告与当前安装及头部几何；页面确认和旧 pending 不能充当实测证据。"""
+    if not isinstance(proof, dict) or proof.get("contract") != "head_mount_fixed_torso_v1":
+        raise CalibError("头部 BMI088 还未完成专用安装核验：去 IMU 页按步骤采集并保存")
+    mount = (calibration.get("imu_mounts") or {}).get("head_bmi088") or {}
+    expected = {"model_sha256": "078693dff3bcd5e69eb6cc483974178e1511a11f762b1a4dd00370bc5d58b8a8",
+                "joints": [{key: row.get(key) for key in ("id", "name", "zero_raw", "direction")}
+                           for row in calibration.get("joints", []) if row.get("id") in (30, 31, 32, 33)]}
+    reports = proof.get("reports")
+    if (mount.get("verified") is not True or not head_quat_matches(mount.get("quat"), quat)
+            or not head_quat_matches(proof.get("mount"), quat)
+            or proof.get("source") != "head_bmi088" or proof.get("binding") != expected
+            or len(expected["joints"]) != 4 or not isinstance(reports, list) or len(reports) != 10):
+        raise CalibError("头部核验报告与当前安装、关节零位或方向不一致，请重新核验")
+    for index, report in enumerate(reports):
+        if (not isinstance(report, dict) or type(report.get("step")) is not int or report["step"] != index
+                or type(report.get("sample_count")) is not int or report["sample_count"] < 60
+                or not _is_num(report.get("sample_span_s")) or report["sample_span_s"] < 1.5):
+            raise CalibError("头部核验报告缺少有效的独立采样证据")
+        if 4 <= index <= 7:
+            limits = (("max_body_error_deg", 0.0, 5.0), ("body_gyro_rms_rad_s", 0.0, 0.15),
+                      ("body_gyro_peak_rad_s", 0.0, 0.5), ("head_span_deg", 8.0, 360.0))
+            if any(not _is_num(report.get(key)) or not low <= report[key] <= high for key, low, high in limits):
+                raise CalibError("头部运动补偿实测误差未达到核验条件")
+    return proof
 
 
 def _raw_position(zero_raw, radians, direction):
@@ -875,10 +933,10 @@ def validate_calibration(cal, source=None):
     bus_q = _quat(cal.get("imu_mount_quat"), "imu_mount_quat")
     mounts = cal.get("imu_mounts")
     mounts = mounts if isinstance(mounts, dict) else {}
-    if set(mounts) - {"bno08x", "lsm6dsv16x"}:
-        raise CalibError(f"imu_mounts 里有不认识的来源：{sorted(set(mounts) - {'bno08x', 'lsm6dsv16x'})}")
+    if set(mounts) - {"bno08x", "lsm6dsv16x", "head_bmi088"}:
+        raise CalibError(f"imu_mounts 里有不认识的来源：{sorted(set(mounts) - {'bno08x', 'lsm6dsv16x', 'head_bmi088'})}")
     checked = [("总线小板", bus_q)]
-    for kind in ("bno08x", "lsm6dsv16x"):
+    for kind in ("bno08x", "lsm6dsv16x", "head_bmi088"):
         mount = mounts.get(kind)
         if mount is None:
             continue
@@ -940,7 +998,7 @@ def validate_calibration(cal, source=None):
     if cal.get("motion_enabled"):
         if any(not j.get("calibrated") or j.get("min_rad") is None or j.get("max_rad") is None for j in joints):
             raise CalibError("motion_enabled = true 时 15 颗都要 calibrated 且有限位")
-        if source in ("bno08x", "lsm6dsv16x"):
+        if source in ("bno08x", "lsm6dsv16x", "head_bmi088"):
             mount = mounts.get(source) or {}
             verified = bool(mount.get("verified")) if isinstance(mount, dict) else False
             label = CHIP_CN[source]
@@ -956,7 +1014,7 @@ def validate_calibration(cal, source=None):
 
 
 def render_calibration(cal):
-    """自己写 TOML：顶层键 → [imu_mounts.*] → [[joints]]。写完要再用 tomllib 读回来核对。"""
+    """写出所有已知来源（含头部安装）与关节；写后须用 tomllib 核对，不丢弃原有安装槽。"""
     lines = [
         f"motion_enabled = {_bool_text(cal.get('motion_enabled'))}",
         f"imu_mount_verified = {_bool_text(cal.get('imu_mount_verified'))}",
@@ -973,7 +1031,7 @@ def render_calibration(cal):
             raise CalibError("imu_bus_profile 只能是 legacy 或 qinmo")
         lines.append(f'imu_bus_profile = "{cal["imu_bus_profile"]}"')
     mounts = cal.get("imu_mounts") or {}
-    for kind in ("bno08x", "lsm6dsv16x"):
+    for kind in ("bno08x", "lsm6dsv16x", "head_bmi088"):
         mount = mounts.get(kind)
         if mount is None:
             continue
@@ -1242,6 +1300,19 @@ def exec_start(op):
     return show(op, "robotd", ["ExecStart"]).get("ExecStart", "")
 
 
+def head_mode_override(op):
+    """只识别本次明确部署的头部主控覆盖；未知版本、额外参数或人工修改一律拒绝自动切换。"""
+    if not exists(op.ctx, HEAD_DIAGNOSTIC_DROPIN):
+        return None
+    with open(op.ctx.p(HEAD_DIAGNOSTIC_DROPIN), "rb") as stream:
+        content = stream.read(4096)
+    expected = (HEAD_OVERRIDE_PREFIX + HEAD_START + " --commissioning\n").encode()
+    motion = (HEAD_OVERRIDE_PREFIX + HEAD_START + "\n").encode()
+    if content not in (expected, motion):
+        raise Stop(EXIT_STATE, "foreign_commissioning", "头部主控覆盖不是已知版本，请由维护者核对；未更改模式")
+    return motion if content == expected else None
+
+
 def calib_mode(op, strict=True):
     """commissioning = 镜像放的 drop-in 在；motion = 不在且 ExecStart 也没有 --commissioning。
     ExecStart 有而 drop-in 不在：不是镜像设的，不敢自动删 / 切。calib-read 只读，strict=False
@@ -1310,6 +1381,7 @@ def calib_gate(op, mode):
 
 
 def check_calib_commit_args(args):
+    """严格解析十五关节和已知 IMU 来源的提交参数；不接受额外证据或未知字段。"""
     check_keys(args, ("by", "joints", "imu", "dry_run"), "calib-commit 的参数")
     by = check_by(args)
     joints = args.get("joints")
@@ -1328,7 +1400,7 @@ def check_calib_commit_args(args):
         raise Stop(EXIT_ARGS, "bad_args", "imu 要是一个对象")
     check_keys(imu, ("source", "quat"), "imu 的参数")
     if imu.get("source") not in IMU_SOURCES:
-        raise Stop(EXIT_ARGS, "bad_args", "imu.source 只能是 bus / bno08x / lsm6dsv16x")
+        raise Stop(EXIT_ARGS, "bad_args", "imu.source 只能是 bus / bno08x / lsm6dsv16x / head_bmi088")
     try:
         quat = normalize_quat(imu.get("quat"))
     except CalibError as e:
@@ -1373,7 +1445,7 @@ def file_meta(ctx, path):
 
 
 def calib_backup(op):
-    """一组一个目录 calib-backups/<序号>-<时间>/：主文件、saved、commissioning（有就备）、manifest。
+    """一组一个目录：保存标定、模式覆盖及存在的头部报告；manifest 记录每个前像。
     序号按已有目录最大值 +1，不看墙钟（板子没有 RTC）。只留最近 10 组。"""
     ensure_dir(op.ctx, CALIB_BACKUP_DIR, 0o700)
     try:
@@ -1391,6 +1463,9 @@ def calib_backup(op):
     ensure_dir(op.ctx, path, 0o700)
     specs = [(CALIB, "hd1910-calibration.toml"), (CALIB_SAVED, "hd1910-calibration.saved.toml"),
              (COMMISSIONING_DROPIN, "zzzz-zz-microduck-commissioning.conf")]
+    for extra, name in ((HEAD_DIAGNOSTIC_DROPIN, "head-diagnostic.conf"), (HEAD_PROOF, "head-imu-proof.json")):
+        if exists(op.ctx, extra):
+            specs.append((extra, name))
     files = []
     for src, name in specs:
         meta, data = file_meta(op.ctx, src)
@@ -1631,7 +1706,7 @@ def _restore_one(op, backup_dir, row, errors):
 
 
 def rollback(op, backup_path):
-    """从备份把主文件 / saved / commissioning 各自换回。结果分开报，回滚自己失败也如实写。"""
+    """恢复标定、原标定覆盖及存在的头部覆盖/报告；分别报告文件、模式和重启恢复结果。"""
     out = {"files_restored": False, "mode_restored": False, "robotd_up_after_rollback": False,
            "errors": [], "backup": backup_path}
     try:
@@ -1649,6 +1724,13 @@ def rollback(op, backup_path):
         ok = _restore_one(op, backup_path, by_path.get(path) or {"path": path, "existed": False}, out["errors"]) and ok
     crow = by_path.get(COMMISSIONING_DROPIN) or {"path": COMMISSIONING_DROPIN, "existed": False}
     mode_ok = _restore_one(op, backup_path, crow, out["errors"])
+    for extra in (HEAD_DIAGNOSTIC_DROPIN, HEAD_PROOF):
+        if extra in by_path:
+            restored = _restore_one(op, backup_path, by_path[extra], out["errors"])
+            if extra == HEAD_DIAGNOSTIC_DROPIN:
+                mode_ok = restored and mode_ok
+            else:
+                ok = restored and ok
     out["files_restored"] = bool(ok)                    # 只算 .toml / .saved.toml，模式另外报
     out["mode_restored"] = bool(mode_ok and exists(op.ctx, COMMISSIONING_DROPIN) == bool(crow.get("existed")))
     op.ctx.run(["systemctl", "daemon-reload"])
@@ -1715,6 +1797,7 @@ def verb_calib_read(op, args):
 
 
 def verb_calib_commit(op, args, raw):
+    """持锁核对、备份并写入标定；头部来源须有真实报告，模式切换失败恢复全部前像。"""
     by, joints, imu, dry = check_calib_commit_args(args)
     op.by = by
     if not dry and op.ctx.env.get(DETACH_ENV) != "1":
@@ -1730,6 +1813,20 @@ def verb_calib_commit(op, args, raw):
     why = calib_gate(op, mode)
     data, st = read_calibration(op)
     rows = data.get("joints") if isinstance(data.get("joints"), list) else []
+    head_override = None
+    if imu["source"] == "head_bmi088":
+        live, error = robotd_bus_status(op)
+        status, status_error = calibration_status(op)
+        if (error or status_error or not isinstance(live, dict) or not isinstance(status, dict)
+                or status.get("imu_source") != "head_bmi088" or live.get("imu_verification")):
+            raise Stop(EXIT_STATE, "readback_mismatch", "头部主控核验未结束或证据未读回，不能写入")
+        if mode == "commissioning" and (live.get("torque_state") != "off" or live.get("phase") != "ready"):
+            raise Stop(EXIT_STATE, "refused", "头部标定写入需要实时反馈就绪且舵机明确断力")
+        try:
+            require_head_proof(data, status.get("head_imu_verification"), imu["quat"])
+        except CalibError as problem:
+            raise Stop(EXIT_STATE, "readback_mismatch", str(problem)) from problem
+        head_override = head_mode_override(op)
     if imu["source"] == "bus":
         live, err = robotd_bus_status(op)
         info, configured, metadata_error = imu_bus_metadata(live)
@@ -1794,8 +1891,10 @@ def verb_calib_commit(op, args, raw):
         if mode == "commissioning":
             if not remove(op.ctx, COMMISSIONING_DROPIN):
                 raise OSError(f"commissioning 文件不见了：{COMMISSIONING_DROPIN}")
+            if head_override is not None:
+                write_atomic(op.ctx, HEAD_DIAGNOSTIC_DROPIN, head_override, 0o644)
             op.ctx.run(["systemctl", "daemon-reload"])
-            op.emit("mode", "info", "删掉出厂标定模式 drop-in，主程序下次启动进运动模式")
+            op.emit("mode", "info", "安装核验通过，已切换已知主控的运动启动参数，重启后独立读回确认")
         restart_robotd(op)
         up, rst = wait_robotd(op)
         base["robotd"] = rst

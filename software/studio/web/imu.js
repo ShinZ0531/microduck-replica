@@ -20,6 +20,7 @@
 import { html, useState, useEffect, useRef } from './vendor/preact-htm.module.js';
 import { Duck3D } from './duck3d.js';
 import { HeadImuPanel } from './head-imu.js';
+import { HeadCalibrationPanel } from './head-calibration.js';
 import { TwoStep } from './confirm.js';
 import { imuDiagnosticCopy } from './startup-status.js';
 
@@ -56,7 +57,7 @@ const STEP = {
 };
 const DIRV = { fwd: [1, 0, 0], back: [-1, 0, 0], left: [0, 1, 0], right: [0, -1, 0] };   // 机身系（= 3D 场景的世界系）
 
-const CHIP_CN = { bus: '总线小板（ID 200）', bno08x: 'BNO085（I²C）', lsm6dsv16x: 'LSM6DSV16X（I²C）' };
+const CHIP_CN = { head_bmi088: '头部 BMI088（关节补偿）', bus: '总线小板（ID 200）', bno08x: 'BNO085（I²C）', lsm6dsv16x: 'LSM6DSV16X（I²C）' };
 const BUS_BOARD_CN = { ft6: 'FT6', imu_to_dxl: 'IMU-to-DXL', sflp_124_12: 'SFLP 124/12', qinmo: 'Qinmo（已配置）' };
 const BUS_PROTOCOL_CN = { feetech: 'Feetech', dxl2: 'Dynamixel 2.0' };
 const unsupportedProfile = info => info && info.profile !== undefined && !['legacy', 'qinmo'].includes(info.profile);
@@ -1021,6 +1022,7 @@ export const _test = { RULES, STEPS, TILTS, feed, freshWizard, startCollect, end
 // ---------------- 页面 ----------------
 
 /** live / age：跟总览同一个判断（app.js 的 Main 里算好传进来）；没传就只看 st.joints_age_ms。 */
+/** 展示原始 HAT 和主控姿态；按实际来源选择独立头部向导或既有固定躯干校准。 */
 export function ImuPage({ st, imu, link, live, age, diagnosticElapsed = 0, pd }) {
   const W = useRef(freshWizard());
   const [, bump] = useState(0);
@@ -1100,11 +1102,14 @@ export function ImuPage({ st, imu, link, live, age, diagnosticElapsed = 0, pd })
       <div class="imu-side">
         <${StatusCard} st=${st} imu=${imu} live=${live} age=${age} diagnosticElapsed=${diagnosticElapsed} />
         <${DiagnosticCard} st=${st} imu=${imu} live=${live} diagnosticElapsed=${diagnosticElapsed} />
-        <${CoarseCard} st=${st} imu=${imu} link=${link} live=${live} />
+        ${imu?.source === 'head_bmi088'
+          ? html`<${HeadCalibrationPanel} imu=${imu} link=${link} live=${live} />`
+          : html`<${CoarseCard} st=${st} imu=${imu} link=${link} live=${live} />
         <${StanceCard} st=${st} imu=${imu} pd=${pd} link=${link} live=${live} />
         <${CollectCard} st=${st} imu=${imu} live=${live} W=${w} act=${act} muted=${muted} setMuted=${setMuted} />
         <${ResultCard} res=${w.phase === 'done' ? res || w.result : null} imu=${imu} link=${link} onRedo=${onRedo} />
-        <${ChipCard} imu=${imu} link=${link} live=${live} diagnosticElapsed=${diagnosticElapsed} />
+        <${ChipCard} imu=${imu} link=${link} live=${live} diagnosticElapsed=${diagnosticElapsed} />`}
+
       </div>
     </div>
     </div></details>

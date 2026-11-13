@@ -14,5 +14,5 @@ ctest --test-dir "$build_dir" --output-on-failure
 # 只使用 Studio 已有依赖；Unix socket 和 HTTP 都指向测试创建的本地模拟服务。
 cd "$studio_dir"
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:deps:dev python3 -m unittest \
-    tests.test_head_imu tests.test_commissioning_view tests.test_sensors_http
+    tests.test_head_imu tests.test_head_calibration tests.test_commissioning_view tests.test_sensors_http
 node tests/head_imu_unit.mjs

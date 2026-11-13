@@ -1,0 +1,831 @@
+diff --git a/microduck-hd1910/firmware/duck-control/src/head_calibration.rs b/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
+new file mode 100644
+index 0000000..aa49d09
+--- /dev/null
++++ b/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
+@@ -0,0 +1,355 @@
++//! 头部 IMU 专用校验的 C++ 绑定；仅封装有界数据、会话与核验报告，不实现第二份几何算法。
++use std::ffi::{c_char, c_void};
++use std::path::{Path, PathBuf};
++use std::time::{Duration, Instant};
++
++use crate::feetech::Calibration;
++use crate::head_compensation::{EncoderPair, HeadCompensation, HeadInput};
++use crate::trunk_imu::{HostImuSample, TrunkImuKind};
++use serde_json::{Value, json};
++
++pub const CONTRACT: &str = "head_mount_fixed_torso_v1";
++
++/// 与独立校准 ABI 一致；现有估计 ABI v1 不改布局。
++#[repr(C)]
++struct Status {
++    version: u32,
++    step: u32,
++    count: u32,
++    available: u32,
++    mount: [f64; 4],
++    span: f64,
++    error_deg: f64,
++    gyro_rms: f64,
++    gyro_peak: f64,
++    head_span: f64,
++    reason: [c_char; 256],
++}
++
++type Create = unsafe extern "C" fn() -> *mut c_void;
++type Destroy = unsafe extern "C" fn(*mut c_void);
++type Observe = unsafe extern "C" fn(*mut c_void, *const HeadInput, *const EncoderPair) -> i32;
++type Capture = unsafe extern "C" fn(*mut c_void, u32, u32, *mut Status) -> i32;
++
++/// 绑定实际头部零位、方向及冻结模型；标志和 motion_enabled 不作为安装几何的一部分。
++pub fn binding(calibration: &Calibration) -> Value {
++    let joints: Vec<_> = calibration
++        .joints
++        .iter()
++        .filter(|joint| [30, 31, 32, 33].contains(&joint.id))
++        .map(|joint| {
++            json!({"id":joint.id,"name":joint.name,"zero_raw":joint.zero_raw,
++            "direction":joint.direction})
++        })
++        .collect();
++    json!({"model_sha256":"078693dff3bcd5e69eb6cc483974178e1511a11f762b1a4dd00370bc5d58b8a8",
++        "joints":joints})
++}
++
++/// 每个 commissioning 消费者独占一个会话；指针不共享给第二线程。
++pub struct Session {
++    _library: libloading::Library,
++    handle: *mut c_void,
++    destroy: Destroy,
++    observe: Observe,
++    capture: Capture,
++    binding: Value,
++    epoch: Option<u32>,
++    sequence: Option<u32>,
++    created: Instant,
++    last_sample: Option<Instant>,
++    reports: Vec<Value>,
++}
++
++// SAFETY: 会话可随控制任务在线程间移动，但所有访问均需 &mut self；C++ 句柄没有共享引用或后台线程。
++unsafe impl Send for Session {}
++
++impl Session {
++    /// 显式使用本地配置的算法库；旧库缺少新符号时拒绝，不伪装支持校准。
++    pub fn new(path: &str, calibration: &Calibration) -> Result<Self, String> {
++        let library =
++            unsafe { libloading::Library::new(path) }.map_err(|error| error.to_string())?;
++        let create = unsafe {
++            *library
++                .get::<Create>(b"microduck_head_calibration_create\0")
++                .map_err(|error| error.to_string())?
++        };
++        let destroy = unsafe {
++            *library
++                .get::<Destroy>(b"microduck_head_calibration_destroy\0")
++                .map_err(|error| error.to_string())?
++        };
++        let observe = unsafe {
++            *library
++                .get::<Observe>(b"microduck_head_calibration_observe\0")
++                .map_err(|error| error.to_string())?
++        };
++        let capture = unsafe {
++            *library
++                .get::<Capture>(b"microduck_head_calibration_capture\0")
++                .map_err(|error| error.to_string())?
++        };
++        let handle = unsafe { create() };
++        if handle.is_null() {
++            return Err("无法创建头部安装核验会话".into());
++        }
++        Ok(Self {
++            _library: library,
++            handle,
++            destroy,
++            observe,
++            capture,
++            binding: binding(calibration),
++            epoch: None,
++            sequence: None,
++            created: Instant::now(),
++            last_sample: None,
++            reports: Vec::new(),
++        })
++    }
++
++    /// 只接受真实 raw provider 与原有编码器历史；来源重启、几何改变或超时使整个会话失效。
++    pub fn observe(
++        &mut self,
++        head: &HeadCompensation,
++        sample: HostImuSample,
++        calibration: &Calibration,
++        now: Instant,
++    ) -> Result<(), String> {
++        if self.created.elapsed() > Duration::from_secs(600) || binding(calibration) != self.binding
++        {
++            return Err("校验会话超时或头部关节配置改变，请重新开始".into());
++        }
++        if self.epoch.is_some_and(|epoch| epoch != sample.epoch) {
++            return Err("头部 IMU 已重连，旧核验数据作废，请重新开始".into());
++        }
++        self.epoch = Some(sample.epoch);
++        if self.sequence == Some(sample.sequence) {
++            return Ok(());
++        }
++        self.sequence = Some(sample.sequence);
++        let Ok((mut input, pair)) = head.calibration_input(&sample, calibration, now) else {
++            self.last_sample = None;
++            return Ok(());
++        };
++        // 此处仅验证原始测量和关节范围；候选安装由 C++ 会话自己求解和应用。
++        input.sensor_to_site = [1.0, 0.0, 0.0, 0.0];
++        let code = unsafe { (self.observe)(self.handle, &input, &pair) };
++        self.last_sample = (code == 0).then_some(sample.received_at);
++        Ok(())
++    }
++
++    /// 保存前检查最后一份测量时效；查询、点击和旧报告都不能替代新鲜实测。
++    pub fn require_fresh(&self) -> Result<(), String> {
++        if self.created.elapsed() > Duration::from_secs(600)
++            || self
++                .last_sample
++                .is_none_or(|at| at.elapsed() > Duration::from_millis(100))
++        {
++            return Err("采样不新鲜或会话已超时，未保存".into());
++        }
++        Ok(())
++    }
++
++    /// 查询或采集下一步骤；失败保留当前步骤，成功结果包含实测误差与采样数量。
++    pub fn capture(&mut self, step: u32, capture: bool) -> Result<Value, String> {
++        if capture
++            && (self.created.elapsed() > Duration::from_secs(600)
++                || self
++                    .last_sample
++                    .is_none_or(|at| at.elapsed() > Duration::from_millis(100)))
++        {
++            return Err("头部采样不新鲜或会话超时，未推进核验".into());
++        }
++        // SAFETY: Status 只含 C POD，零填充同时保证错误文本有终止符。
++        let mut status: Status = unsafe { std::mem::zeroed() };
++        let result = unsafe { (self.capture)(self.handle, step, u32::from(capture), &mut status) };
++        if status.version != 1 || status.step > 10 {
++            return Err("头部校准 ABI 返回无效状态".into());
++        }
++        let row = json!({"step":step,"sample_count":status.count,"sample_span_s":status.span,
++            "max_body_error_deg":status.error_deg,"body_gyro_rms_rad_s":status.gyro_rms,
++            "body_gyro_peak_rad_s":status.gyro_peak,"head_span_deg":status.head_span});
++        if result != 0 {
++            let bytes: Vec<_> = status
++                .reason
++                .iter()
++                .take_while(|value| **value != 0)
++                .map(|value| *value as u8)
++                .collect();
++            return Err(format!(
++                "{}（{} 帧，躯干残差 {:.2}°，角速度 RMS {:.3}、峰值 {:.3} rad/s，关节行程 {:.1}°）",
++                String::from_utf8_lossy(&bytes),
++                status.count,
++                status.error_deg,
++                status.gyro_rms,
++                status.gyro_peak,
++                status.head_span
++            ));
++        }
++        if capture {
++            self.reports.push(row);
++        }
++        Ok(
++            json!({"contract":CONTRACT,"next_step":status.step,"ready_to_save":status.step==10,
++            "sample_count":status.count,"sample_span_s":status.span,
++            "mount":(status.available==1).then_some(status.mount),"reports":self.reports,
++            "binding":self.binding,"epoch":self.epoch}),
++        )
++    }
++}
++
++impl Drop for Session {
++    /// 在 Library 卸载之前释放 C++ 状态；无后台任务或设备副作用。
++    fn drop(&mut self) {
++        unsafe { (self.destroy)(self.handle) };
++    }
++}
++
++/// 核验报告与标定文件放在同一受保护目录，不进入通用发布配置。
++pub fn proof_path(path: &Path) -> PathBuf {
++    path.with_extension("head-imu-proof.json")
++}
++
++/// 检查报告的数据形状和已发布门限；报告本身只能由原生会话产生，不能由网页上传。
++fn valid_report(index: usize, report: &Value) -> bool {
++    let number = |key: &str| {
++        report
++            .get(key)
++            .and_then(Value::as_f64)
++            .filter(|value| value.is_finite())
++    };
++    let basic = report.get("step") == Some(&json!(index))
++        && report
++            .get("sample_count")
++            .and_then(Value::as_u64)
++            .is_some_and(|count| count >= 60)
++        && number("sample_span_s").is_some_and(|span| span >= 1.5);
++    if (4..=7).contains(&index) {
++        basic
++            && number("max_body_error_deg").is_some_and(|value| (0.0..=5.0).contains(&value))
++            && number("body_gyro_rms_rad_s").is_some_and(|value| (0.0..=0.15).contains(&value))
++            && number("body_gyro_peak_rad_s").is_some_and(|value| (0.0..=0.5).contains(&value))
++            && number("head_span_deg").is_some_and(|value| (8.0..=360.0).contains(&value))
++    } else {
++        basic
++    }
++}
++
++/// 只认可同一安装四元数、四个头颈关节配置及完整十步的本地主控报告。
++pub fn verified_proof(path: &Path, calibration: &Calibration) -> Option<Value> {
++    let proof: Value = serde_json::from_slice(&std::fs::read(proof_path(path)).ok()?).ok()?;
++    let mount = calibration.imu_mount(TrunkImuKind::HeadBmi088);
++    let reports = proof.get("reports")?.as_array()?;
++    if !mount.verified
++        || proof.get("contract")? != CONTRACT
++        || proof.get("source")? != "head_bmi088"
++        || proof.get("binding")? != &binding(calibration)
++        || proof.get("mount")? != &json!(mount.quat)
++        || reports.len() != 10
++        || reports
++            .iter()
++            .enumerate()
++            .any(|(index, report)| !valid_report(index, report))
++    {
++        return None;
++    }
++    Some(proof)
++}
++
++/// 原子保存有界主控报告；先保存报告再保存 verified，避免无报告的半次成功。
++pub fn save_proof(path: &Path, proof: &Value) -> Result<(), String> {
++    use std::io::Write;
++    let destination = proof_path(path);
++    let temporary = destination.with_extension("json.tmp");
++    let data = serde_json::to_vec_pretty(proof).map_err(|error| error.to_string())?;
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&temporary)
++        .map_err(|error| error.to_string())?;
++    let result = (|| {
++        file.write_all(&data)?;
++        file.sync_all()?;
++        std::fs::rename(&temporary, &destination)
++    })();
++    if result.is_err() {
++        let _ = std::fs::remove_file(&temporary);
++    }
++    result.map_err(|error| error.to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::feetech::ImuMount;
++
++    /// 只构造受保护文件形状的合成报告，不宣称是物理安装证明。
++    fn fixture() -> (Calibration, Value) {
++        let mut calibration = Calibration::commissioning(crate::model::JOINT_IDS);
++        calibration.set_imu_mount(
++            TrunkImuKind::HeadBmi088,
++            ImuMount {
++                quat: [0.5, 0.5, 0.5, 0.5],
++                verified: true,
++            },
++        );
++        let reports: Vec<_> = (0..10)
++            .map(|step| {
++                json!({"step":step,"sample_count":100,
++            "sample_span_s":1.98,"max_body_error_deg":0.1,"body_gyro_rms_rad_s":0.01,"body_gyro_peak_rad_s":0.02,
++            "head_span_deg":10.0})
++            })
++            .collect();
++        let proof = json!({"contract":CONTRACT,"source":"head_bmi088",
++            "mount":[0.5,0.5,0.5,0.5],"binding":binding(&calibration),"reports":reports});
++        (calibration, proof)
++    }
++
++    /// 报告必须匹配实际关节配置和安装；写入运动开关本身不改变安装几何绑定。
++    #[test]
++    fn proof_is_bound_to_head_geometry_not_motion_switch() {
++        let (mut calibration, proof) = fixture();
++        let directory = std::env::temp_dir().join(format!(
++            "head-proof-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        std::fs::create_dir(&directory).unwrap();
++        let path = directory.join("calibration.toml");
++        assert!(verified_proof(&path, &calibration).is_none());
++        save_proof(&path, &proof).unwrap();
++        assert!(verified_proof(&path, &calibration).is_some());
++        calibration.motion_enabled = true;
++        assert!(verified_proof(&path, &calibration).is_some());
++        calibration
++            .joints
++            .iter_mut()
++            .find(|joint| joint.id == 31)
++            .unwrap()
++            .zero_raw += 1;
++        assert!(verified_proof(&path, &calibration).is_none());
++        std::fs::remove_dir_all(directory).unwrap();
++    }
++
++    /// 真实库有独立校准 ABI，但创建会话、查询或伪造步号不能替代真实采样。
++    #[test]
++    #[ignore = "requires MICRODUCK_HEAD_CORE_TEST_LIB; run verify-native.sh"]
++    fn real_library_does_not_certify_empty_session() {
++        let path = std::env::var("MICRODUCK_HEAD_CORE_TEST_LIB").unwrap();
++        let (calibration, _) = fixture();
++        let mut session = Session::new(&path, &calibration).unwrap();
++        assert!(session.require_fresh().is_err());
++        assert!(session.capture(0, true).is_err());
++        assert!(session.capture(9, true).is_err());
++        let status = session.capture(0, false).unwrap();
++        assert_eq!(status["next_step"], 0);
++        assert_eq!(status["ready_to_save"], false);
++        assert_eq!(status["mount"], Value::Null);
++        assert_eq!(status["reports"], json!([]));
++        assert_eq!(std::mem::size_of::<Status>(), 344);
++    }
++}
+diff --git a/microduck-hd1910/firmware/duck-control/src/head_compensation.rs b/microduck-hd1910/firmware/duck-control/src/head_compensation.rs
+index 37e40e2..b0a88b1 100644
+--- a/microduck-hd1910/firmware/duck-control/src/head_compensation.rs
++++ b/microduck-hd1910/firmware/duck-control/src/head_compensation.rs
+@@ -14,20 +14,20 @@ const HEAD_IDS: [u8; 4] = [30, 31, 32, 33];
+ /// ABI v1 input, matching head_body_estimator.h; units are radians and monotonic ns.
+ #[repr(C)]
+ #[derive(Default)]
+-struct HeadInput {
+-    version: u32,
+-    mount_verified: u32,
+-    joints_verified: u32,
+-    reserved: u32,
+-    now_ns: u64,
+-    imu_ns: u64,
+-    joint_ns: u64,
+-    velocity_ns: u64,
+-    quat: [f64; 4],
+-    gyro: [f64; 3],
+-    angles: [f64; 4],
+-    velocities: [f64; 4],
+-    sensor_to_site: [f64; 4],
++pub(crate) struct HeadInput {
++    pub(crate) version: u32,
++    pub(crate) mount_verified: u32,
++    pub(crate) joints_verified: u32,
++    pub(crate) reserved: u32,
++    pub(crate) now_ns: u64,
++    pub(crate) imu_ns: u64,
++    pub(crate) joint_ns: u64,
++    pub(crate) velocity_ns: u64,
++    pub(crate) quat: [f64; 4],
++    pub(crate) gyro: [f64; 3],
++    pub(crate) angles: [f64; 4],
++    pub(crate) velocities: [f64; 4],
++    pub(crate) sensor_to_site: [f64; 4],
+ }
+ 
+ /// ABI v1 output; status and availability must be checked before using any numbers.
+@@ -48,13 +48,13 @@ struct BodyEstimate {
+ /// Two complete, measured head encoder packets bracketing the IMU sample.
+ #[repr(C)]
+ #[derive(Default)]
+-struct EncoderPair {
+-    previous: [i32; 4],
+-    current: [i32; 4],
+-    direction: [i32; 4],
+-    zero: [i32; 4],
+-    previous_ns: u64,
+-    current_ns: u64,
++pub(crate) struct EncoderPair {
++    pub(crate) previous: [i32; 4],
++    pub(crate) current: [i32; 4],
++    pub(crate) direction: [i32; 4],
++    pub(crate) zero: [i32; 4],
++    pub(crate) previous_ns: u64,
++    pub(crate) current_ns: u64,
+ }
+ 
+ type Estimate =
+@@ -140,15 +140,13 @@ impl HeadCompensation {
+         Ok(())
+     }
+ 
+-    /// Interpolate measured encoders around the source-clock IMU sample, never extrapolate.
+-    /// Unverified calibration permits a diagnostic estimate but cannot pass motion startup.
+-    pub fn compensate(
++    /// 为诊断估计和安装核验共用同一份真实编码器对齐输入；不读取目标角或伪造缺失帧。
++    pub(crate) fn calibration_input(
+         &self,
+-        sample: Option<HostImuSample>,
++        sample: &HostImuSample,
+         calibration: &Calibration,
+         now: Instant,
+-    ) -> Result<HostImuSample> {
+-        let mut sample = sample.ok_or_else(|| refused("no head IMU sample"))?;
++    ) -> Result<(HeadInput, EncoderPair)> {
+         let (previous, current) = self
+             .history
+             .iter()
+@@ -190,6 +188,19 @@ impl HeadCompensation {
+             sensor_to_site: mount.quat,
+             ..HeadInput::default()
+         };
++        Ok((input, pair))
++    }
++
++    /// Interpolate measured encoders around the source-clock IMU sample, never extrapolate.
++    /// Unverified calibration permits a diagnostic estimate but cannot pass motion startup.
++    pub fn compensate(
++        &self,
++        sample: Option<HostImuSample>,
++        calibration: &Calibration,
++        now: Instant,
++    ) -> Result<HostImuSample> {
++        let mut sample = sample.ok_or_else(|| refused("no head IMU sample"))?;
++        let (input, pair) = self.calibration_input(&sample, calibration, now)?;
+         let mut output = BodyEstimate::default();
+         // POD layout is pinned by tests; the core has no IO, allocation or exceptions.
+         let status = unsafe { (self.estimate)(&input, &pair, &mut output) };
+diff --git a/microduck-hd1910/firmware/duck-control/src/lib.rs b/microduck-hd1910/firmware/duck-control/src/lib.rs
+index fa0dd62..45bf89c 100644
+--- a/microduck-hd1910/firmware/duck-control/src/lib.rs
++++ b/microduck-hd1910/firmware/duck-control/src/lib.rs
+@@ -16,6 +16,7 @@ pub mod feetech_snapshot;
+ pub mod full_q4;
+ pub mod gyro_fusion;
+ pub mod head_compensation;
++pub mod head_calibration;
+ pub mod hardware;
+ pub mod imu;
+ pub mod io;
+diff --git a/microduck-hd1910/firmware/duck-ipc-proto/src/lib.rs b/microduck-hd1910/firmware/duck-ipc-proto/src/lib.rs
+index d4658fe..c94a64e 100644
+--- a/microduck-hd1910/firmware/duck-ipc-proto/src/lib.rs
++++ b/microduck-hd1910/firmware/duck-ipc-proto/src/lib.rs
+@@ -450,7 +450,8 @@ pub const JSONRPC_VERSION: &str = "2.0";
+ /// Install the matching robotd/Studio pair: calibration-status advertises
+ /// imu_verification_contract and successful verify-imu includes imu_check proof.
+ /// Old clients must not infer verification from operator confirmation alone.
+-pub const API_VERSION: u32 = 43;
++/// API44 的本地头部核验扩展需配套 Studio、算法库和专用核验报告；不等于 RC4 发行版。
++pub const API_VERSION: u32 = 44;
+ 
+ /// The observation width every policy this robot family runs is built against.
+ ///
+diff --git a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+index 5c2b833..8449c81 100644
+--- a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::sync::oneshot;
+ 
+-pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.2";
++pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.3";
+ const MAX_PENDING: usize = 16;
+ const POSITION_TOLERANCE: u16 = 8;
+ const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
+@@ -81,6 +81,17 @@ pub enum BusCommand {
+         #[serde(default)]
+         mount_wxyz: Vec<f64>,
+     },
++    /// 头部 IMU 专用流程；只采真实反馈，只有 save 且十步齐全时才保存安装核验。
++    HeadImuCalibration {
++        #[arg(long)]
++        operation: String,
++        #[arg(long, default_value_t = 0)]
++        #[serde(default)]
++        step: u32,
++        #[arg(long, default_value_t = false)]
++        #[serde(default)]
++        confirmed: bool,
++    },
+     /// Ramp all fifteen joints together to the HOME pose and keep them there, torque on, so
+     /// the robot can stand for a standing IMU check without leaving commissioning. Holds until
+     /// `relax` (robot.relax / robot.stop), a sustained bus failure or the service stopping.
+@@ -384,6 +395,11 @@ pub(crate) fn calibration_status(
+         "motion_validation":calibration.validate_motion_for(source).err().map(|e| e.to_string()),
+         "note":"Capture uses a manually known joint angle; encoder center is not joint zero."});
+     let mount = calibration.imu_mount(source);
++    if source == TrunkImuKind::HeadBmi088 {
++        status["head_imu_verification"] = duck_control::head_calibration::verified_proof(path, calibration)
++            .unwrap_or(Value::Null);
++        status["head_imu_verification_contract"] = json!(duck_control::head_calibration::CONTRACT);
++    }
+     // A persisted bus verification is not effective until the discovered wire format and
+     // configured data profile have both been checked. I2C has its independent mount slot.
+     let verified = source != TrunkImuKind::Bus && mount.verified;
+@@ -993,6 +1009,96 @@ fn save_verified(
+     Ok((updated, status))
+ }
+ 
++/// 只处理明确的头部校验请求；采样和几何在主控/C++ 内完成，不接受页面上传测量或四元数。
++#[allow(clippy::too_many_arguments)]
++fn process_head_job(
++    job: Job,
++    session: &mut Option<duck_control::head_calibration::Session>,
++    calibration: &mut Calibration,
++    path: &Path,
++    source: TrunkImuKind,
++    library: Option<&str>,
++    safe: bool,
++) {
++    if job.reply.is_closed() {
++        return;
++    }
++    let BusCommand::HeadImuCalibration {
++        operation,
++        step,
++        confirmed,
++    } = job.command
++    else {
++        let _ = job
++            .reply
++            .send(Err("invalid head calibration dispatch".into()));
++        return;
++    };
++    let result = (|| -> Result<Value, String> {
++        if source != TrunkImuKind::HeadBmi088 {
++            return Err("当前不是头部 BMI088 来源".into());
++        }
++        if operation == "status" {
++            return session.as_mut().map_or_else(
++                || Ok(json!({"active":false,"contract":duck_control::head_calibration::CONTRACT})),
++                |session| {
++                    session.capture(0, false).map(|mut status| {
++                        status["active"] = json!(true);
++                        status
++                    })
++                },
++            );
++        }
++        if !confirmed {
++            return Err("请明确确认按当前步骤固定机身或头部；未保存".into());
++        }
++        if operation == "cancel" {
++            *session = None;
++            return Ok(json!({"active":false,"cancelled":true}));
++        }
++        if !safe {
++            return Err("头部校验需要十五颗舵机已断力、没有移动或其他标定任务".into());
++        }
++        if operation == "start" {
++            let created = duck_control::head_calibration::Session::new(
++                library.ok_or("未配置头部算法库")?,
++                calibration,
++            )?;
++            *session = Some(created);
++        } else if operation != "capture" && operation != "save" {
++            return Err("未知的头部校验操作".into());
++        }
++        let current = session.as_mut().ok_or("头部校验会话已结束，请重新开始")?;
++        if operation == "capture" {
++            return current.capture(step, true).map(|mut status| {
++                status["active"] = json!(true);
++                status
++            });
++        }
++        let mut status = current.capture(0, false)?;
++        status["active"] = json!(true);
++        if operation != "save" {
++            return Ok(status);
++        }
++        if status["ready_to_save"] != true || status["reports"].as_array().map(Vec::len) != Some(10)
++        {
++            return Err("十步真实核验尚未完成，未保存".into());
++        }
++        // 同一会话的最后实测必须仍新鲜；状态查询本身不能刷新证据。
++        current.require_fresh()?;
++        let mount: [f64; 4] =
++            serde_json::from_value(status["mount"].clone()).map_err(|error| error.to_string())?;
++        status["source"] = json!("head_bmi088");
++        duck_control::head_calibration::save_proof(path, &status)?;
++        let (updated, reply) = save_verified(calibration, path, source, mount, None)?;
++        *calibration = updated;
++        *session = None;
++        Ok(json!({"active":false,"saved":true,"calibration":reply}))
++    })();
++    let _ = job.reply.send(result);
++}
++
++/// 保留原有总线标定与断力控制；头部专用命令必须由独立会话入口处理。
+ #[allow(clippy::too_many_arguments)]
+ fn process_job(
+     job: Job,
+@@ -1066,6 +1172,9 @@ fn process_job(
+         return;
+     }
+     match job.command {
++        BusCommand::HeadImuCalibration { .. } => {
++            let _ = job.reply.send(Err("head calibration must run through the dedicated session".into()));
++        }
+         BusCommand::Move {
+             id,
+             position,
+@@ -1584,6 +1693,7 @@ pub async fn run(
+     let mut raw_reading = None;
+     let mut raw_sequence = None;
+     let mut verifying: Option<PendingVerify> = None;
++    let mut head_session: Option<duck_control::head_calibration::Session> = None;
+     let mut last_sample = None;
+     let mut last_failure = None;
+     let mut errors_by_id = BTreeMap::<u8, u64>::new();
+@@ -1620,7 +1730,14 @@ pub async fn run(
+                 let now = Instant::now();
+                 let latest = if let Some(head) = head_compensation.as_mut() {
+                     head.observe(samples.iter().map(|(id, sample)| (*id, sample)), now).map_err(|error| error.to_string())?;
+-                    Some(head.compensate(host.latest(), &calibration, now).map_err(|error| error.to_string())?)
++                    let raw = host.latest();
++                    if let (Some(session), Some(sample)) = (head_session.as_mut(), raw) {
++                        if let Err(error) = session.observe(head, sample, &calibration, now) {
++                            tracing::warn!("head calibration invalidated: {error}");
++                            head_session = None;
++                        }
++                    }
++                    Some(head.compensate(raw, &calibration, now).map_err(|error| error.to_string())?)
+                 } else { host.latest() };
+                 let before = imu_gate.stale();
+                 let checked = imu_gate.check(latest, now);
+@@ -1737,7 +1854,12 @@ pub async fn run(
+                 tracing::warn!(cycle,%error,"bus read failed");
+             }
+             while let Some(job) = state.bus_commands.pop() {
+-                if matches!(job.command, BusCommand::Relax) {
++                if matches!(&job.command, BusCommand::HeadImuCalibration { operation, .. }
++                    if operation == "cancel" || operation == "status") {
++                    process_head_job(job, &mut head_session, &mut calibration, calibration_path,
++                        source, host_imu.and_then(|host| host.head_estimator_library()), false);
++                } else if matches!(job.command, BusCommand::Relax) {
++                    head_session = None;
+                     process_job(
+                         job,
+                         &mut bus,
+@@ -1816,11 +1938,23 @@ pub async fn run(
+                 );
+             }
+             if let Some(job) = state.bus_commands.pop() {
+-                let changes_calibration = matches!(
++                let head_command = matches!(job.command, BusCommand::HeadImuCalibration { .. });
++                let changes_calibration = head_command || matches!(
+                     job.command,
+                     BusCommand::Capture { .. } | BusCommand::VerifyImu { .. }
+                 );
+                 let old_mount = calibration.imu_mount(source).quat;
++                if head_command {
++                    process_head_job(job, &mut head_session, &mut calibration, calibration_path,
++                        source, host_imu.and_then(|host| host.head_estimator_library()),
++                        motion.is_none() && hold.is_none() && off_pending.is_none() && verifying.is_none());
++                } else if head_session.is_some() && !matches!(job.command,
++                    BusCommand::Relax | BusCommand::CalibrationStatus | BusCommand::Reboot {} | BusCommand::Shutdown {}) {
++                    let _ = job.reply.send(Err("头部校验期间不能移动或写关节；先取消校验".into()));
++                } else {
++                    if matches!(job.command, BusCommand::Relax | BusCommand::Reboot {} | BusCommand::Shutdown {}) {
++                        head_session = None;
++                    }
+                 process_job(
+                     job,
+                     &mut bus,
+@@ -1838,6 +1972,7 @@ pub async fn run(
+                     &mut verifying,
+                     &mut hold,
+                 );
++                }
+                 if changes_calibration {
+                     state
+                         .bus_calibration
+@@ -1977,9 +2112,11 @@ pub async fn run(
+                             .validate_bus_mount_for(bus.imu_board().protocol(), bus.imu_profile())
+                             .is_ok()),
+                 imu_bus: bus.imu_info(),
+-                imu_verification: verifying
+-                    .as_ref()
+-                    .map(|_| "verify-imu: tip the robot nose-down by 15-30 degrees and hold it"),
++                imu_verification: if head_session.is_some() {
++                    Some("head-imu: calibration session active; motors remain off")
++                } else {
++                    verifying.as_ref().map(|_| "verify-imu: tip the robot nose-down by 15-30 degrees and hold it")
++                },
+                 torque_state: if off_pending.is_some() {
+                     "unknown"
+                 } else if let Some(h) = &hold {
+@@ -2048,6 +2185,71 @@ pub async fn run(
+ mod tests {
+     use super::*;
+ 
++    /// 头部保存必须来自真实会话；未确认、未完成和未断力均不能改变标定或创建证明文件。
++    #[test]
++    fn head_calibration_requires_confirmation_session_and_torque_off() {
++        let mut calibration = Calibration::commissioning(JOINT_IDS);
++        let before = serde_json::to_value(&calibration).unwrap();
++        let mut session = None;
++        let path =
++            std::env::temp_dir().join(format!("unused-head-write-{}.toml", std::process::id()));
++        for (operation, confirmed, safe) in [
++            ("start", false, true),
++            ("save", true, true),
++            ("capture", true, true),
++            ("start", true, false),
++        ] {
++            let (reply, mut result) = oneshot::channel();
++            process_head_job(
++                Job {
++                    command: BusCommand::HeadImuCalibration {
++                        operation: operation.into(),
++                        step: 0,
++                        confirmed,
++                    },
++                    reply,
++                },
++                &mut session,
++                &mut calibration,
++                &path,
++                TrunkImuKind::HeadBmi088,
++                None,
++                safe,
++            );
++            assert!(result.try_recv().unwrap().is_err());
++            assert_eq!(serde_json::to_value(&calibration).unwrap(), before);
++            assert!(!duck_control::head_calibration::proof_path(&path).exists());
++        }
++    }
++
++    /// 扩展合同与旧躯干合同分开发布；未核验头部来源不因识别成功而变成 verified。
++    #[test]
++    fn head_calibration_advertises_a_separate_contract() {
++        let calibration = Calibration::commissioning(JOINT_IDS);
++        let status = calibration_status(
++            &calibration,
++            Path::new("/unused-head-proof"),
++            TrunkImuKind::HeadBmi088,
++        );
++        assert_eq!(
++            status["head_imu_verification_contract"],
++            duck_control::head_calibration::CONTRACT
++        );
++        assert_eq!(status["head_imu_verification"], Value::Null);
++        assert_eq!(status["imu_mount_verified"], false);
++    }
++
++    /// 原生 JSON 命令不接受客户端提供四元数、样本或通过标志。
++    #[test]
++    fn head_calibration_does_not_accept_client_supplied_proof() {
++        for field in ["mount_wxyz", "samples", "verified", "reports"] {
++            let mut request =
++                json!({"action":"head-imu-calibration","operation":"save","confirmed":true});
++            request[field] = json!(true);
++            assert!(serde_json::from_value::<BusCommand>(request).is_err());
++        }
++    }
++
+     /// Optimizing the motion Value cache must not shadow commissioning's typed
+     /// snapshot or change its existing serialization and error/status fields.
+     #[tokio::test]
+diff --git a/microduck-hd1910/firmware/robotd/src/feetech_commissioning_bus_verify_tests.rs b/microduck-hd1910/firmware/robotd/src/feetech_commissioning_bus_verify_tests.rs
+index 2872f92..d93296e 100644
+--- a/microduck-hd1910/firmware/robotd/src/feetech_commissioning_bus_verify_tests.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_commissioning_bus_verify_tests.rs
+@@ -27,6 +27,7 @@ fn pty() -> (String, File, File) {
+ }
+ 
+ #[test]
++/// API44 增加独立头部核验，原 ID200 直立/前倾合同保持原语义。
+ fn bus_verify_publishes_the_independent_contract() {
+     let status = calibration_status(
+         &Calibration::commissioning(JOINT_IDS),
+@@ -34,7 +35,7 @@ fn bus_verify_publishes_the_independent_contract() {
+         TrunkImuKind::Bus,
+     );
+     assert_eq!(status["imu_verification_contract"], "upright_nose_down_v1");
+-    assert_eq!(duck_ipc_proto::API_VERSION, 43);
++    assert_eq!(duck_ipc_proto::API_VERSION, 44);
+ }
+ 
+ #[test]
+diff --git a/microduck-hd1910/firmware/robotd/src/main.rs b/microduck-hd1910/firmware/robotd/src/main.rs
+index c395707..b6c7ec7 100644
+--- a/microduck-hd1910/firmware/robotd/src/main.rs
++++ b/microduck-hd1910/firmware/robotd/src/main.rs
+@@ -1575,6 +1575,10 @@ fn open_bus(
+                 report["configured_imu_profile"] = serde_json::json!(bus.imu_profile.label());
+                 state.bus_calibration.store(Some(Arc::new(report)));
+             }
++            if kind == TrunkImuKind::HeadBmi088
++                && duck_control::head_calibration::verified_proof(path, &calibration).is_none() {
++                return Err("head_bmi088 motion requires a complete native head calibration proof matching the current mount and joints".into());
++            }
+             if let Err(problem) = calibration.validate_motion_for(kind) {
+                 // An uncommissioned but structurally valid configuration still names
+                 // the sole UART. Preserve the motion refusal and collect reads only.

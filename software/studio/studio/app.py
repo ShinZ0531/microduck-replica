@@ -682,6 +682,7 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
             return None
 
     async def ws_endpoint(ws: WebSocket):
+        """鉴权后连接页面状态流并分派用户操作；断开时取消本连接拥有的任务和订阅。"""
         token, sess = session_of(ws)
         if not origin_ok(ws):
             log.warn(f"拒绝了一个来源不对的页面连接（{_client_desc(ws)}）", cat="连接",
@@ -912,7 +913,7 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
                 pass
 
         async def run_imu_op(cid, args):
-            """IMU 页的操作：现在只有 solve（算安装方向）；写入、粗校、换芯片要上鸭子再接。"""
+            """转交固定躯干或头部专用 IMU 操作；错误原样反馈，主控持有真实测量与保存权限。"""
             from .imu import Refused as ImuRefused
             data, ok, reason = None, True, None
             if imu is None:
