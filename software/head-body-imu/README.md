@@ -51,8 +51,9 @@ bash software/head-body-imu/scripts/prepare-runtime.sh /path/to/runtime --apply
 原生仓库的 Apache-2.0 许可保存在 `patches/LICENSE.runtime`。
 
 应用后按原生仓库 `CONTRIBUTING.md` 的工具链构建。该基线要求 Rust 1.99+，
-Linux 构建还需要其原有 C 库、模型及 ONNX 运行库。当前本地未完成 Rust/ARM64 重建，
-补丁校验通过不能代替它。
+Linux 构建还需要其原有 C 库、模型及 ONNX 运行库。2026-11-13 已完成 Rust 主机和 ARM64 重建、
+实机无硬件加载及算法测试，但完整原生回归尚有失败项，候选控制器未激活。
+构建、部署和实测边界见[整合与上机验证记录](../../docs/head-imu-integration-20261113.md)。
 
 ## 与 Studio 的关系
 
@@ -63,10 +64,9 @@ Studio 的 IMU 页新增原始 HAT 卡片；`/api/head-imu` 复用 tofd 只读�
 不迁移旧 `/api/body-imu-preview`：它依赖 Studio 自己接管舵机总线，
 不作为 robotd 控制时的数据来源。C++ 计算只在原生控制器接入层执行。
 
-## 上机前仍需完成
+## 后续验证
 
-- 只读核对板上 robotd、tofd、Studio 的实际路径、版本和服务覆盖，保存可恢复备份。
-- 重建并核验 ARM64 产物；部署脚本需按板上现有更新器与定制路径设计。
+- 设备快照、双份备份、Studio 独立目录部署与网页实测已完成；原生候选仍需完整回归及基线对比。
 - 固定躯干，验证传感器到头部模型的安装变换和头颈关节方向；再验证身体倾斜时的方向与时效。
 - 完成专用校准保存及控制条件检查后，另行进行坐站、碰撞与行走验收。
 
