@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "runtime": {
+    "repository": "https://github.com/fanhao375/Microduck-kissqy",
+    "base_commit": "eecac1878136d3188370a5f6460b7d0521cf845d",
+    "patch": "patches/head-bmi088.patch",
+    "tracked_modified_files": 11,
+    "new_files": 3,
+    "license": "Apache-2.0; patches/LICENSE.runtime"
+  },
+  "model": {
+    "repository": "https://github.com/fanhao375/Microduck-kissqy",
+    "commit": "eecac1878136d3188370a5f6460b7d0521cf845d",
+    "path": "microduck-hd1910/firmware/kinematics/assets/alpha/robot_walk.xml",
+    "sha256": "078693dff3bcd5e69eb6cc483974178e1511a11f762b1a4dd00370bc5d58b8a8",
+    "fixture": "source/tests/mujoco_head_fixtures.inc"
+  },
+  "state": {
+    "diagnostic_only": true,
+    "motion_authorized": false,
+    "physical_mount_verified": false,
+    "walking_verified": false
+  },
+  "legacy_sources": {
+    "source/head_body_estimator.h": "1e9d56b759e01e85b4ea47f83fe599ed77d58e895ef4850e9d06cf2bc3f7caab",
+    "source/head_body_estimator.cpp": "744e1b656d839df6bad8d6b492c70b7e47bb50c14badab3d662f211ee7f237a5",
+    "source/tests/estimator_tests.cpp": "4378041b9ffccd490dffc46dca4b7c55543f5b7ddbb228b0fce8ebfa8f5238b8",
+    "source/tests/mujoco_head_fixtures.inc": "239f2388bc859de4e3b829540dd8d24d1d037eacf976f2f679cd0561dfc63302"
+  }
+}

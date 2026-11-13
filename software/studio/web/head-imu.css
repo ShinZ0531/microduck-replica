@@ -1,0 +1,240 @@
+/* Scoped extension: keep the Studio palette, type and navigation unchanged. */
+.hat-imu {
+  background: var(--board);
+  border: 1px solid var(--board-edge);
+  border-radius: var(--radius-board);
+  overflow: hidden;
+}
+.hat-imu-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px;
+}
+.hat-imu-heading h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+.hat-imu-heading p {
+  margin: 4px 0 0;
+  color: var(--text-2);
+  font-size: 13px;
+}
+.hat-status {
+  flex: none;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.hat-status.live {
+  color: var(--ok);
+}
+.hat-status.waiting {
+  color: var(--warn);
+}
+.hat-imu-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(350px, 1.2fr);
+}
+.hat-pose {
+  display: grid;
+  place-items: center;
+  background: #1e1f22;
+  min-height: 300px;
+}
+.hat-pose svg {
+  width: 100%;
+  max-height: 340px;
+  display: block;
+}
+.hat-pose-empty {
+  color: #c7c9cf;
+  padding: 24px;
+  font-size: 14px;
+}
+.hat-readings {
+  padding: 20px;
+  min-width: 0;
+}
+.hat-angles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+.hat-angles > div {
+  display: flex;
+  flex-direction: column;
+}
+.hat-angles span {
+  color: var(--text-2);
+  font-size: 13px;
+}
+.hat-angles b {
+  font-size: 28px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.hat-angles small {
+  font-size: 16px;
+  font-weight: 400;
+  margin-left: 2px;
+  color: var(--text-2);
+}
+.hat-frame-note, .hat-help {
+  margin: 8px 0 12px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.hat-vectors {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  table-layout: fixed;
+}
+.hat-vectors th, .hat-vectors td {
+  padding: 7px 0;
+  text-align: right;
+  font-weight: 400;
+}
+.hat-vectors th:first-child {
+  width: 40%;
+  text-align: left;
+}
+.hat-vectors thead th {
+  color: var(--text-2);
+  font-size: 12px;
+}
+.hat-vectors small {
+  display: inline-block;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.hat-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.hat-meta b {
+  color: var(--text);
+  font-weight: 400;
+}
+.hat-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+.hat-actions button {
+  min-height: 36px;
+  padding: 6px 12px;
+  background: var(--board);
+  color: var(--text);
+  border: 1px solid #c8c8cc;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.hat-actions button:hover:not(:disabled) {
+  border-color: var(--text-2);
+}
+.hat-actions button:disabled {
+  color: var(--text-2);
+}
+.hat-help {
+  margin-bottom: 0;
+}
+.hat-feedback {
+  padding: 12px 20px;
+  border-top: 1px solid var(--line);
+  color: var(--text-2);
+  font-size: 13px;
+}
+.hat-body-calibration {
+  margin-top: 8px;
+}
+.hat-body-calibration > summary {
+  cursor: pointer;
+  padding: 12px 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+.hat-body-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 8px;
+}
+.hat-body-content h2 {
+  margin: 0;
+  font-size: 18px;
+}
+@media (max-width: 1050px) {
+  .hat-imu-grid {
+    grid-template-columns: 1fr;
+  }
+  .hat-pose {
+    min-height: 240px;
+  }
+  .hat-pose svg {
+    height: 260px;
+  }
+}
+/* The existing shell wraps its tall sidebar above the page at tablet widths.
+Keep navigation compact only while the new IMU page is open. */
+@media (min-width: 701px) and (max-width: 839px) {
+  .shell:has(.imu-page) > .nav {
+    flex: 1 0 100%;
+    max-width: none;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 12px 24px;
+    gap: 4px;
+  }
+  .shell:has(.imu-page) > .nav .nav-logo {
+    padding: 0 12px 0 0;
+  }
+  .shell:has(.imu-page) > .nav .spacer {
+    display: none;
+  }
+  .shell:has(.imu-page) > .nav a {
+    height: 40px;
+  }
+}
+@media (max-width: 480px) {
+  .hat-imu-heading {
+    padding: 14px;
+    gap: 8px;
+  }
+  .hat-imu-heading h2 {
+    font-size: 16px;
+  }
+  .hat-status {
+    font-size: 12px;
+  }
+  .hat-readings {
+    padding: 16px 14px;
+  }
+  .hat-angles {
+    gap: 8px;
+  }
+  .hat-angles b {
+    font-size: 24px;
+  }
+  .hat-actions button {
+    min-height: 44px;
+  }
+  .hat-vectors {
+    font-size: 13px;
+  }
+  .hat-vectors th:first-child {
+    width: 38%;
+  }
+  .hat-feedback {
+    padding: 12px 14px;
+    font-size: 12px;
+  }
+}

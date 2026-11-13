@@ -174,7 +174,14 @@ class ImuBackendTest(unittest.TestCase):
         self.assertEqual(v["mount"], {"quat": [1, 0, 0, 0], "verified": False})
 
     def test_view_commissioning_reads_last_sample(self):
-        v = self.backend(bus=commissioning_bus(), calib=factory_calib()).view()
+        """标定快照必须有源时间与当前连接证据，才能显示为实时姿态。"""
+        bus = commissioning_bus()
+        bus["updated_at_us"] = 20000
+        bus["last_sample"]["at_us"] = 10000
+        bus["last_sample"]["imu"]["age_ms"] = 5
+        backend = self.backend(bus=bus, calib=factory_calib())
+        backend.rd.present = True
+        v = backend.view()
         self.assertEqual(v["mode"], "commissioning")
         self.assertTrue(v["ready"])
         self.assertEqual(v["reader"]["state"], "streaming")

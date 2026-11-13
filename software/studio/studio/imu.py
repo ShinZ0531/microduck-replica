@@ -16,6 +16,7 @@ import os
 import time
 
 from . import helper, imu_calib
+from .commissioning_view import commissioning_view
 from .robotd import fresh_calib
 from .rpc import RpcError, Timeout, Unreachable, call_once
 from .startup_status import imu_context_current, imu_diagnostic
@@ -169,6 +170,7 @@ class ImuBackend:
     # ---- 推给页面 ----
 
     def view(self):
+        """读取当前来源及安装状态；标定模式沿用源帧新鲜度检查，不重放旧姿态。"""
         bus = self.rd.bus.value if isinstance(self.rd.bus.value, dict) else {}
         current = not hasattr(self.rd, "present") or imu_context_current(self.rd)
         if not current:
@@ -191,8 +193,16 @@ class ImuBackend:
         ls = bus.get("last_sample") if isinstance(bus.get("last_sample"), dict) else {}
         s_imu = ls.get("imu") if isinstance(ls.get("imu"), dict) else {}
         reader = native.get("imu_reader")
+        commissioning = commissioning_view(self.rd)
+        age_ms = native.get("imu_age_ms", s_imu.get("age_ms"))
+        ready = native.get("imu_ready", s_imu.get("ready"))
+        valid, gravity = s_imu.get("valid"), s_imu.get("gravity")
         if reader is None and bus.get("mode") == "commissioning":
             reader = {"state": ("streaming" if s_imu.get("ready") else "missing"), "errors": 0}
+        if commissioning is not None:
+            reader = {"state": "streaming" if commissioning["imu_fresh"] else "missing", "errors": None}
+            age_ms, ready = commissioning["imu_age_ms"], commissioning["imu_fresh"]
+            valid, gravity = commissioning["imu_fresh"], commissioning["gravity"]
         return {
             "t": "imu", "mode": bus.get("mode"), "source": source, "chip_setting": None, "mount": mount,
             "diagnostic": imu_diagnostic(self.rd),
@@ -202,9 +212,7 @@ class ImuBackend:
             "metadata_error": imu_bus_metadata(bus)[2] if source in (None, "bus") else None,
             "profile_selection": self._profile_view(bus, source, redo),
             "mount_protocol_mismatch": bus_protocol_mismatch(bus, calib, source),
-            "reader": reader, "age_ms": native.get("imu_age_ms", s_imu.get("age_ms")),
-            "ready": native.get("imu_ready", s_imu.get("ready")),
-            "valid": s_imu.get("valid"), "gravity": s_imu.get("gravity"),
+            "reader": reader, "age_ms": age_ms, "ready": ready, "valid": valid, "gravity": gravity,
             "hold": bus.get("hold") if isinstance(bus.get("hold"), dict) else None,
             "detected": self.detected, "stand_calib_at": self._stand_calib_at(), "job": self.job,
             "redo": redo,

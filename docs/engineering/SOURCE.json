@@ -1,0 +1,17 @@
+{
+  "source_package": "EngineeringStandards_20261105",
+  "scope": "project development guidance only; no global installation",
+  "sha256": {
+    "CPP_CSHARP_PROJECT_LAYOUT.md": "b72bee4bd16026d858b9f745b757fa93c9c0eb0bd347891a9dde45cb548cff88",
+    "READABLE_CODE.md": "5bef4da11efbd938e6f8605b0fe6e9d55bb3dd2ac6b9985aa965e86778ed1462",
+    "METHOD_COMMENTS.md": "a23f167325fc51399d74b913696de95cc9ce89cb1d00d42ff7edcc6b0b2dd1b0",
+    "AI_CODE_GENERATION.md": "8b02fbbe84f8b9ac85a0d8ea3f2b0fb656da197e3fb2776964b13a020e4cbdfb",
+    "CPP_PYTHON_RULES.md": "a1641ad1dd7943a18c367473d477a9565640e45f2829dc7a094224d676796e4c",
+    "CODING_STANDARDS_CATALOG.md": "6d1cadae9a6c60c9e310aa5a84673bceaf3dfcdd2a28e67965f066b781d84347",
+    "CODE_FORMAT.md": "b4e7ff65751f7b99f981ad3c7ee751de273b448ce350b27cef5a64ce7714f03a",
+    "code-format/.prettierrc.json": "1927087be3d51f8709bfec68c676f9a36c4253eb6e01558eacb9efc9c9be5d0f",
+    "code-format/.prettierignore": "ab4addc18778de083b038b486c31138ee702573fe242e6710179f905dd6947b4",
+    "code-format/.editorconfig": "2a88567414949e095f798977e14228d16f08a49003efc08559ced825a4d534ea",
+    "code-format/.clang-format": "2246e187ecbdd85e7d55da3182a458e1aac907b49b8c55f7dc88c0d476f3b534"
+  }
+}

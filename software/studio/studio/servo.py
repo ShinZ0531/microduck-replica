@@ -29,6 +29,7 @@ import threading
 import time
 
 from .bus import feetech
+from .commissioning_view import commissioning_view
 from .startup_status import servo_observations
 
 IDS = [20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14]     # 跟 robotd 的 JOINT_NAMES 同一个顺序
@@ -673,6 +674,9 @@ def view_from_robotd(bus, directions, state="closed", error=None, sim=False):
     rd = bus if hasattr(bus, "bus") else None
     if rd is not None:
         bus = rd.bus.value
+    commissioning = commissioning_view(rd)
+    if commissioning is not None:
+        return _view_commissioning(commissioning, directions, state, error, sim)
     observations = servo_observations(bus, present=getattr(rd, "present", None),
                                       bus_age_s=rd.bus.age() if rd is not None else None,
                                       bus_error=getattr(rd.bus, "error", None) if rd is not None else None)
@@ -706,6 +710,44 @@ def view_from_robotd(bus, directions, state="closed", error=None, sim=False):
         "port": "主程序", "online": sum(1 for r in rows if r["fresh"]), "total": len(IDS),
         "hz": None, "avg_volts": avg_v, "battery_pct": battery_percent(avg_v), "drop_rate": None, "bus": None,
         "holding": sum(1 for r in rows if r["torque"] == 1), "all_off": False, "latched": False,
+        "relaxing": False, "last_relax": None, "rows": rows,
+    }
+
+
+def _view_commissioning(view, directions, state, error, sim):
+    """显示标定模式的实际回读；缺失关节和过期扭矩保留未知，不取得串口。"""
+    rows, volts = [], []
+    torque = {"off": 0, "all_enabled": 1}.get(view["torque"])
+    for sid in IDS:
+        sample = view["rows"].get(sid, {})
+        raw = sample.get("position_raw")
+        fresh = raw is not None
+        direction = DEFAULT_DIRECTIONS[sid] if directions is None else directions.get(sid, -1)
+        cn, en = NAMES[sid]
+        volt = sample.get("voltage_v")
+        if volt is not None:
+            volts.append(volt)
+        rows.append({
+            "id": sid, "cn": cn, "en": en, "group": GROUP[sid], "dir": direction,
+            "raw": raw, "deg": round(angle_deg(raw, direction), 1) if fresh else None,
+            "volt": volt, "temp": sample.get("temperature_c"), "temp_limit": None,
+            "load": sample.get("load_raw"), "speed_raw": sample.get("speed_raw"),
+            "current_raw": sample.get("current_raw"), "current_ma": None, "status": None,
+            "moving": int(sample["moving"]) if isinstance(sample.get("moving"), bool) else None,
+            "torque": torque if fresh else None, "torque_source": "controller",
+            "fresh": fresh, "feedback_fresh": fresh, "age_ms": view["age_ms"],
+            "p": None, "d": None, "mode": None, "offset": None,
+            "comm": {key: None for key in ("asked", "ok", "missed", "alarm", "streak", "max_streak")},
+        })
+    avg_volts = round(sum(volts) / len(volts), 2) if volts else None
+    online = sum(row["fresh"] for row in rows)
+    return {
+        "t": "servo", "state": state, "error": error, "sim": sim, "source": "robotd",
+        "port": "主程序", "online": online if view["fresh"] else None, "total": len(IDS),
+        "hz": view["hz"], "avg_volts": avg_volts, "battery_pct": battery_percent(avg_volts),
+        "drop_rate": None, "bus": None,
+        "holding": sum(row["torque"] == 1 for row in rows) if online == len(IDS) and torque is not None else None,
+        "all_off": online == len(IDS) and torque == 0, "latched": False,
         "relaxing": False, "last_relax": None, "rows": rows,
     }
 

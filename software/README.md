@@ -10,6 +10,7 @@
 |---|---|---|---|
 | **复刻镜像** | 烧卡开机就能用的整套系统：主程序、模型、Studio、首次开机和配网 | [`image/`](image/)：用户看[烧录和第一次使用](image/烧录和第一次使用.md)，做镜像的人看 [image/README.md](image/README.md)。已发布版本见 [Releases](https://github.com/fanhao375/microduck-replica/releases/latest) | 构建脚本 Apache-2.0；镜像里各部分的许可见镜像内 `/usr/share/doc/microduck/` |
 | **Microduck Studio** | 装在鸭子上的网页中控：状态、卸力、舵机零位、IMU 方向、写进主程序、手柄、遥控、日志 | [`studio/`](studio/)。用复刻镜像的不用另装 | 代码 Apache-2.0 |
+| **头部 IMU 诊断** | 本 fork 的 BMI088 头部运动补偿核心、Studio 只读显示及固定版本原生补丁 | [`head-body-imu/`](head-body-imu/README.md)。安装核验和运动验收尚未完成 | 代码沿用本仓软件许可；原生补丁保留 Apache-2.0 |
 | **网页软件更新** | 签名组件包、独立更新服务、离线上传、安装与回退 | [`updater/`](updater/)，20261027镜像预装；旧卡先一次性SSH引导，[操作说明](../docs/软件更新与语音使用说明-20261027.md) | Apache-2.0 |
 | **本地坐站语音** | R3单击监听开关、中文坐下/站起来、鸭叫提示 | [`duck-echo/`](duck-echo/)，20261027镜像附中文模型与ARM64依赖；无需云端Key | 代码Apache-2.0，模型与依赖按各自许可 |
 | **主程序 robotd / padd / mediad** | 在官方 0.15.1 上加了飞特 HD-1910 舵机总线、I²C IMU 模块、陀螺融合、UDP 手柄 | 复刻镜像里已经装好。各版本构建、提交号和下载见 [镜像说明](image/README.md)及[公开发布页](https://github.com/fanhao375/microduck-replica/releases) | Apache-2.0 |

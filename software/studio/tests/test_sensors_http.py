@@ -22,8 +22,28 @@ class SensorStub:
         return {'state': 'unavailable', 'connected': False, 'reason': '未接 ToF'}
 
 
+class HeadImuStub:
+    """只读 HTTP 边界测试使用的内存传感器，不打开真实套接字或设备。"""
+
+    def __init__(self):
+        """记录读取与关闭次数，以验证鉴权和应用资源生命周期。"""
+        self.calls = 0
+        self.closed = False
+
+    async def view(self):
+        """返回明确未核验的传感器样本，保留有效零角速度。"""
+        self.calls += 1
+        return {"fresh": True, "mount_verified": False, "frame_name": "sensor",
+                "frame": {"quat": [1, 0, 0, 0], "gyro": [0, 0, 0], "seq": 1}}
+
+    async def close(self):
+        """记录应用退出时已释放只读订阅。"""
+        self.closed = True
+
+
 class SensorHttp(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        """启动本机模拟主控和网页，传感器读取器使用内存替身。"""
         self.tmp = tempfile.TemporaryDirectory()
         self.log = Log(Path(self.tmp.name) / 'logs', echo=False, background=False)
         self.auth = Auth(Path(self.tmp.name) / 'state', self.log)
@@ -32,8 +52,9 @@ class SensorHttp(unittest.IsolatedAsyncioTestCase):
         self.fake_server, port = await self.fake.serve_tcp()
         self.rd = Robotd(f'tcp:127.0.0.1:{port}', f'tcp:127.0.0.1:{port}', self.log)
         self.sensors = SensorStub()
+        self.head_imu = HeadImuStub()
         app = build_app(auth=self.auth, robotd=self.rd, log=self.log, web_dir=WEB,
-                        duck={'label': '测试鸭'}, sensors=self.sensors)
+                        duck={'label': '测试鸭'}, sensors=self.sensors, head_imu=self.head_imu)
         self.server = uvicorn.Server(uvicorn.Config(app, host='127.0.0.1', port=0, ws='wsproto', http='h11',
                                                   lifespan='on', log_level='critical'))
         self.task = asyncio.create_task(self.server.serve())
@@ -43,8 +64,10 @@ class SensorHttp(unittest.IsolatedAsyncioTestCase):
         self.origin = f'http://127.0.0.1:{self.port}'
 
     async def asyncTearDown(self):
+        """关闭本地服务器并核对新增只读订阅已随应用释放。"""
         self.server.should_exit = True
         await self.task
+        self.assertTrue(self.head_imu.closed)
         self.fake_server.close()
         await self.fake_server.wait_closed()
         self.tmp.cleanup()
@@ -58,10 +81,23 @@ class SensorHttp(unittest.IsolatedAsyncioTestCase):
         return {'Cookie': headers['set-cookie'].split(';')[0]}
 
     async def test_sensor_reads_require_session_when_password_is_set(self):
-        for path in ('/api/camera', '/api/tof'):
+        """未登录的传感器读取被拒绝，头部读取器不得因此启动。"""
+        for path in ('/api/camera', '/api/tof', '/api/head-imu'):
             status, _, result = await self.call('GET', path)
             self.assertEqual(status, 401)
             self.assertFalse(result['ok'])
+        self.assertEqual(self.head_imu.calls, 0)
+
+    async def test_head_imu_is_authenticated_readonly_sensor_data(self):
+        """原始 HAT 数据不冒充已核验躯干姿态，响应不缓存且关闭时释放。"""
+        headers = await self.login()
+        status, response, result = await self.call('GET', '/api/head-imu', headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(response['cache-control'], 'no-store')
+        self.assertEqual(result['data']['frame_name'], 'sensor')
+        self.assertFalse(result['data']['mount_verified'])
+        self.assertEqual(result['data']['frame']['gyro'], [0, 0, 0])
+        self.assertEqual(self.head_imu.calls, 1)
 
     async def test_authenticated_reads_are_truthful_and_not_cached(self):
         headers = await self.login()

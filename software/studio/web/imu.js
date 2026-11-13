@@ -19,6 +19,7 @@
 //   总线板卡由主程序启动时自动识别；I²C 芯片检测仍用 microduck-firstboot。
 import { html, useState, useEffect, useRef } from './vendor/preact-htm.module.js';
 import { Duck3D } from './duck3d.js';
+import { HeadImuPanel } from './head-imu.js';
 import { TwoStep } from './confirm.js';
 import { imuDiagnosticCopy } from './startup-status.js';
 
@@ -1077,15 +1078,19 @@ export function ImuPage({ st, imu, link, live, age, diagnosticElapsed = 0, pd })
   const arrow = w.phase === 'collect' && w.done.still ? nextTodo(w) : null;
   const cue = w.phase === 'collect' ? (!w.done.still ? '静止 3 秒：别碰它' : arrow ? `下一个：${STEP[arrow].cn}（顺序随便）` : null) : null;
   return html`<div class="imu-page">
+    <header class="sv-head"><h1>IMU</h1><span class="sv-sub">HAT 原始读数与主程序躯干姿态</span></header>
+    <${HeadImuPanel} />
+    <details class="hat-body-calibration" open><summary>主程序躯干姿态与安装校准</summary>
+    <div class="hat-body-content">
     <header class="sv-head">
-      <h1>IMU</h1>
+      <h2>躯干 IMU</h2>
       <span class="sv-metrics num">
         <span>方向 <b>${S.word}</b></span>
         <span>倾角 <b>${fmt(st?.tilt_deg)}°</b>${F.live ? '' : `（${F.text}）`}</span>
         <span>芯片 <b>${chipLabel(imu, live, diagnosticElapsed)}</b></span>
       </span>
     </header>
-    <div class="sv-sub">IMU 告诉策略「机身往哪边歪」。大家装的都不一样，装歪几度站着看不出来，一走就往前冲（一号鸭 10-12 装歪 8.5° 就是这样），所以要重新校一下。</div>
+    <div class="sv-sub">这里显示主程序使用的躯干姿态。头部 BMI088 必须结合实际关节反馈补偿；安装方向与关节方向尚未核验时，读数可用于诊断，不能视为已完成步态校准。</div>
     <${JobBanner} job=${imu?.job} />
     ${msg ? html`<div class=${'banner ' + (msg.ok ? 'warn' : 'bad')} role="status"><span>${msg.text}</span>
       <a href="#" onClick=${(e) => { e.preventDefault(); setMsg(null); }}>知道了</a></div>` : null}
@@ -1102,5 +1107,6 @@ export function ImuPage({ st, imu, link, live, age, diagnosticElapsed = 0, pd })
         <${ChipCard} imu=${imu} link=${link} live=${live} diagnosticElapsed=${diagnosticElapsed} />
       </div>
     </div>
+    </div></details>
   </div>`;
 }

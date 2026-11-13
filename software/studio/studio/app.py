@@ -38,6 +38,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from .head_imu import HeadImuReader
 from .auth import COOKIE, REMEMBER_S, Auth, OriginGuard
 from . import helper
 from .rpc import open_conn
@@ -160,8 +161,11 @@ def _bus_give_back(by, servo=None):
 
 def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev_autologin=False, servo=None, imu=None, pad=None,
               onboard=None, battery=None, tune=None, net=None, commit=None, ssh_home=None, models=None, sensors=None, updates=None,
-              ca_cert=None):
+              ca_cert=None, head_imu=None):
+    """装配网页与现有控制后端；头部 IMU 只读订阅随应用关闭释放。"""
     guard = OriginGuard(names=names)
+    if head_imu is None:
+        head_imu = HeadImuReader(getattr(sensors, "tof_addr", "unix:/run/tofd/tof.sock"))
     ai = AiService(state_dir)
     updates = updates or Updates()
     if pad is not None:
@@ -525,6 +529,15 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
 
     async def api_tof(request):
         return await sensor_read(request, "tof")
+
+    async def api_head_imu(request):
+        """返回登录会话可读的原始 HAT 数据，不触发标定或取得舵机总线。"""
+        headers = {"Cache-Control": "no-store"}
+        _, session = session_of(request)
+        if not session:
+            return JSONResponse({"ok": False, "error": "先登录才能查看 HAT IMU"},
+                                status_code=401, headers=headers)
+        return JSONResponse({"ok": True, "data": await head_imu.view()}, headers=headers)
 
     def model_response(payload, status=200):
         return JSONResponse(payload, status_code=status, headers={"Cache-Control": "no-store"})
@@ -1592,6 +1605,7 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
+        """管理网页后台任务及传感器订阅，不在退出时自动卸力。"""
         await updates.start_readiness(update_readiness)
         watch = asyncio.create_task(servo_watch())
         feed = asyncio.create_task(pad_feed()) if pad is not None else None
@@ -1608,6 +1622,7 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
         log.info(f"Studio {VERSION} 启动 · Python {platform.python_version()} · {platform.node()}", cat="系统",
                  dedup=False)
         yield
+        await head_imu.close()
         await updates.stop_readiness()
         restore.cancel()
         watch.cancel()
@@ -1712,6 +1727,7 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
         Route("/api/profile", api_profile),
         Route("/api/camera", api_camera),
         Route("/api/tof", api_tof),
+        Route("/api/head-imu", api_head_imu),
         Route("/api/models", api_models),
         Route("/api/models/op", api_model_op, methods=["POST"]),
         Route("/api/models/import", api_model_import, methods=["POST"]),

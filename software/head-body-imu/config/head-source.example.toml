@@ -1,0 +1,6 @@
+# 仅供审核的参数片段，不直接覆盖整台设备的 robotd.toml。
+# 路径需与将来核对过的板上部署一致；不设置安装核验、零位或运动开关。
+[trunk_imu]
+source = "head_bmi088"
+head_socket = "/run/tofd/tof.sock"
+head_estimator_library = "/opt/microduck/local-components/head-body-v1/libmicroduck_head_body.so"

@@ -114,6 +114,10 @@ py -3.13 -I run.py --bench
 
 ## 装到鸭子上
 
+本 fork 的头部 BMI088 整合说明见 [head-body-imu](../head-body-imu/README.md)。IMU 页可分别查看
+HAT 原始读数与主程序躯干反馈；显示参考归零不写安装标定。原生接入仍受安装与关节核验限制，
+这里的源码更新不等于鸭子已部署，也不代表头部传感器已能用于走路。
+
 1. 拷贝：把 `software/studio` 整个目录拷到鸭子的 `/home/radxa/studio-dev`（`scp -r`、U 盘解压包都行）。
 2. 自检：在鸭子上运行 `python3 -I run.py --selfcheck`（只读：打印版本，对 robotd / configd / padd 各问一次）。
 3. 装 root 小助手：`cd deploy && sudo sh install.sh radxa`。0.7.2 的小助手负责舵机总线交接、手柄配对、热点开关、`calib-read` / `calib-commit`（把标定写进主程序、切运动模式）、`ssh-status` / `ssh-password`（「更多」页的 SSH 开关），以及 `imu-recalibrate`（重新校验已保存的 IMU 安装方向）；关热点前会写 `/run/microduck/studio-connecting.json`，让 netcheck 在连接期间别插手。从舵机页交还时，标定模式的实时快照也算主程序起来了（0.5.1 只认运动模式的 `control`，标定模式下每次都等满 30 秒判「起不来」）。步骤、卸载和上机核对见 `deploy/INSTALL.md`。

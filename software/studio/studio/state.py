@@ -19,6 +19,7 @@
 import math
 import time
 
+from .commissioning_view import commissioning_view
 from .estop import STARTING_LONG_S, STARTING_PHASES
 from .startup import startup_todo
 from .startup_status import imu_context_current, imu_diagnostic, servo_observations, startup_wait
@@ -180,6 +181,7 @@ def summarize(rd, duck, servo=None, now=None, ob=None, bat=None, net=None, commi
     health, pol, st = _fresh(rd.health, "health", now), _fresh(rd.policies, "policies", now), _fresh(rd.state, "state", now)
     bus_age, st_age = rd.bus.age(now), rd.state.age(now)
     native = (bus or {}).get("native") if isinstance((bus or {}).get("native"), dict) else {}
+    commissioning = commissioning_view(rd, now)
 
     # 新鲜度：Studio 自己多久没拿到新数据（浏览器那边再加上传输的年龄）
     freshest = min([a for a in (bus_age, st_age) if a is not None], default=None)
@@ -206,8 +208,17 @@ def summarize(rd, duck, servo=None, now=None, ob=None, bat=None, net=None, commi
         servos = {"online": observations["online"], "total": len(rows) or 15,
                   "hottest": {"name": JOINT_CN.get(hot["name"], hot["name"]), "c": hot["temperature_c"]} if hot else None,
                   "stale": [JOINT_CN.get(r["name"], r["name"]) for r in rows if r["responding"] is False]}
+    if commissioning is not None:
+        measured = list(commissioning["rows"].values())
+        temperatures = [row for row in measured if row["temperature_c"] is not None]
+        hot = max(temperatures, key=lambda row: row["temperature_c"]) if temperatures else None
+        servos = {"online": len(measured) if commissioning["fresh"] else None, "total": 15,
+                  "hottest": {"name": JOINT_CN.get(hot["name"], hot["name"]), "c": hot["temperature_c"]} if hot else None,
+                  "stale": []}
     imu_h = (health or {}).get("imu") or {}
-    if imu_h.get("ready") is False:
+    if commissioning is not None:
+        imu_status = commissioning["imu_status"]
+    elif imu_h.get("ready") is False:
         imu_status = "missing"
     elif (imu_h.get("consecutive_stale_blocks") or 0) >= 25:
         imu_status = "frozen"
@@ -236,16 +247,12 @@ def summarize(rd, duck, servo=None, now=None, ob=None, bat=None, net=None, commi
     st_age_live = st_age
     state_t_ns = st_any.get("t_ns")
     hold = (bus or {}).get("hold") if isinstance((bus or {}).get("hold"), dict) else None
-    if (bus or {}).get("mode") == "commissioning":
-        # 标定模式没有 robot.state：IMU 读数从 busStatus.last_sample 拿（标定模式 10 Hz 轮询），
-        # IMU 页的「现在」和站着校准就都有实时数据了（用户 10-21：标定模式也能站姿、站着校）
-        ls = (bus or {}).get("last_sample") if isinstance((bus or {}).get("last_sample"), dict) else {}
-        s_imu = ls.get("imu") if isinstance(ls.get("imu"), dict) else {}
-        g = s_imu.get("gravity")
-        if s_imu.get("valid") is True and isinstance(g, list) and len(g) == 3:
-            grav = g
-            st_age_live = bus_age
-            state_t_ns = ls.get("at_us") * 1000 if isinstance(ls.get("at_us"), int) else None
+    if commissioning is not None:
+        # 标定模式无 robot.state；不能把重复收到的旧 last_sample 刷成实时姿态。
+        grav = commissioning["gravity"]
+        st_age_live = commissioning["imu_age_ms"] / 1000 if commissioning["imu_fresh"] else None
+        state_t_ns = commissioning["state_t_ns"]
+        js = None
     pose = posture(rd.present, bus, pol, st)
     est = rd.estop.status(present=rd.present is not False, bus=bus, bus_age_s=bus_age, now=now)
     if servo_orphan_view(servo) is not None and rd.present is not True:
@@ -281,7 +288,8 @@ def summarize(rd, duck, servo=None, now=None, ob=None, bat=None, net=None, commi
         "starting_long": starting_s is not None and starting_s >= STARTING_LONG_S,
         "battery": battery,
         "servos": servos,
-        "imu": {"status": imu_status, "source": native.get("imu_source"),
+        "imu": {"status": imu_status,
+                "source": commissioning["imu_source"] if commissioning is not None else native.get("imu_source"),
                 "configured_imu_profile": native.get("configured_imu_profile", (bus or {}).get("configured_imu_profile")),
                 "context_current": imu_context_current(rd, now),
                 "generation": getattr(getattr(rd, "hello", None), "at", None),

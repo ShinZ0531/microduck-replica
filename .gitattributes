@@ -46,3 +46,5 @@ software/studio/run.py           text eol=lf
 
 # A7Z Python, shell, systemd and patch sources are installed on Linux.
 radxa-cubie-a7z/** text eol=lf
+# Unified-diff empty context lines contain one space; git apply checks added source whitespace.
+software/head-body-imu/patches/*.patch whitespace=-blank-at-eol

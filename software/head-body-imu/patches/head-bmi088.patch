@@ -1,0 +1,1304 @@
+diff --git a/microduck-hd1910/firmware/deploy/robotd.toml b/microduck-hd1910/firmware/deploy/robotd.toml
+index bef4608..bfd3ad1 100644
+--- a/microduck-hd1910/firmware/deploy/robotd.toml
++++ b/microduck-hd1910/firmware/deploy/robotd.toml
+@@ -56,6 +56,12 @@ port = "/dev/ttyS2"
+ # IMU display takes the same lock. docs/design/robotd-design.md §2.6 has the whole of it.
+ # Needs a robotd restart.
+ # source = "bus"
++# Moving-head HAT BMI088 uses source = "head_bmi088", measured ID 30–33 encoders,
++# and the separately installed ABI-v1 C++ compensation library. Its calibration
++# quaternion is sensor-to-head-site, not sensor-to-trunk; the fixed-body verify-imu
++# procedure above does not apply. See robotd-design.md §2.6, moving-head subsection.
++# head_socket = "/run/tofd/tof.sock"
++# head_estimator_library = "/opt/microduck/local-components/head-body-v1/libmicroduck_head_body.so"
+ 
+ # The i2c-dev node and 7-bit address a module source is read through. /dev/i2c-4 is the Zero
+ # 3W header's I2C once the i2c4 overlay is enabled. A BNO08x answers at 0x4B with its address
+diff --git a/microduck-hd1910/firmware/docs/design/robotd-design.md b/microduck-hd1910/firmware/docs/design/robotd-design.md
+index 78e37cd..805607b 100644
+--- a/microduck-hd1910/firmware/docs/design/robotd-design.md
++++ b/microduck-hd1910/firmware/docs/design/robotd-design.md
+@@ -658,6 +658,30 @@ observation slots.
+ 
+ ### 2.6 Where the trunk IMU is wired
+ 
++**Moving-head HAT BMI088 (`head_bmi088`).** This explicit Feetech source subscribes to
++`head_imu.stream` on `head_socket` (default `/run/tofd/tof.sock`); tofd remains the only I2C
++owner. It never identifies or reads ID 200. The reader checks the BMI088 subscription,
++source sequence, finite values and `CLOCK_MONOTONIC` sample age before publishing a raw
++sensor snapshot. A disconnected or restarted stream clears the snapshot and starts a new
++epoch; the existing one-second settling gate still applies.
++
++Commissioning and FeetechIo each keep eight complete measured ID 30–33 encoder packets.
++Two packets must bracket the IMU's source timestamp, 5–40 ms apart and no more than 50 ms
++old. No encoder extrapolation, stale cache or commanded joint target is substituted.
++`head_estimator_library` loads the local ABI-v1 `microduck_estimate_encoders` C++ core once,
++outside the tick. That core interpolates angles and removes head angular velocity:
++`q_WB = q_WS inverse(q_BS)` and `omega_B = R_BS omega_S - J(q) qdot`.
++
++`[imu_mounts.head_bmi088] quat` means **sensor-to-model-head-site**, unlike the fixed-body
++sources. The compensated reading is already body-frame, so TrunkFrame uses identity and
++retains its readiness/median gates. The fixed-body `verify-imu` command explicitly refuses
++this source: its upright check cannot certify a moving head mount. Until mounting axes and
++head joint directions are physically validated with the torso fixed, its source-specific
++`verified` flag stays false and motion remains disabled. Diagnostic estimates alone never
++authorize motion. Head translational acceleration can still bias tofd's Madgwick attitude;
++the implementation does not claim to remove that effect. Raw `--read-only` telemetry is
++explicitly marked sensor-frame and uncompensated.
++
+ By default, and originally, the trunk IMU is the `imu_to_dxl` board: ID 200 on the servo bus,
+ read in the servos' own `sync_read` (§1.1). On the Feetech backend (`bus.protocol = "feetech"`)
+ `[trunk_imu] source` can name a module on the board's own I²C instead — `bno08x` (BNO085/BNO086,
+diff --git a/microduck-hd1910/firmware/duck-control/src/feetech.rs b/microduck-hd1910/firmware/duck-control/src/feetech.rs
+index 735bccc..1a03acd 100644
+--- a/microduck-hd1910/firmware/duck-control/src/feetech.rs
++++ b/microduck-hd1910/firmware/duck-control/src/feetech.rs
+@@ -1565,6 +1565,9 @@ pub struct ImuMount {
+ #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct ImuMounts {
++    /// Sensor-to-model-head-site quaternion; compensation produces body-frame data.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub head_bmi088: Option<ImuMount>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub bno08x: Option<ImuMount>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -1572,13 +1575,14 @@ pub struct ImuMounts {
+ }
+ impl ImuMounts {
+     fn is_empty(&self) -> bool {
+-        self.bno08x.is_none() && self.lsm6dsv16x.is_none()
++        self.bno08x.is_none() && self.lsm6dsv16x.is_none() && self.head_bmi088.is_none()
+     }
+     fn slot(&mut self, kind: TrunkImuKind) -> Option<&mut Option<ImuMount>> {
+         match kind {
+             TrunkImuKind::Bus => None,
+             TrunkImuKind::Bno08x => Some(&mut self.bno08x),
+             TrunkImuKind::Lsm6dsv16x => Some(&mut self.lsm6dsv16x),
++            TrunkImuKind::HeadBmi088 => Some(&mut self.head_bmi088),
+         }
+     }
+ }
+@@ -1699,6 +1703,7 @@ impl Calibration {
+             }),
+             TrunkImuKind::Bno08x => self.imu_mounts.bno08x,
+             TrunkImuKind::Lsm6dsv16x => self.imu_mounts.lsm6dsv16x,
++            TrunkImuKind::HeadBmi088 => self.imu_mounts.head_bmi088,
+         };
+         commissioned.unwrap_or(ImuMount {
+             quat: kind.default_mount(),
+@@ -1715,6 +1720,10 @@ impl Calibration {
+             }
+         }
+     }
++    /// Head compensation already emits body-frame data; applying its mount twice is wrong.
++    pub fn control_imu_mount(&self, kind: TrunkImuKind) -> [f64; 4] {
++        if kind == TrunkImuKind::HeadBmi088 { [1.0, 0.0, 0.0, 0.0] } else { self.imu_mount(kind).quat }
++    }
+     pub fn validate(&self) -> Result<()> {
+         if self.imu_bus_protocol == Some(BusImuProtocol::Auto) {
+             return Err(error(
+@@ -2138,6 +2147,7 @@ pub struct FeetechIo {
+     imu_observation: Option<imu_observation::Snapshot>,
+     calibration: Calibration,
+     imu: TrunkImu,
++    head_compensation: Option<crate::head_compensation::HeadCompensation>,
+     latest_ready: bool,
+     latest_slow: Option<SlowSensors>,
+     latest_sample_at: Option<Instant>,
+@@ -2237,15 +2247,18 @@ impl FeetechIo {
+                 "the bus IMU board is read in the servos' Sync Read, not through a host reader",
+             ));
+         }
++        let head_compensation = crate::head_compensation::HeadCompensation::for_reader(reader.as_ref())?;
+         let imu = TrunkImu::Host {
+-            frame: TrunkFrame::new(calibration.imu_mount(kind).quat),
++            frame: TrunkFrame::new(calibration.control_imu_mount(kind)),
+             gate: HostImuGate::default(),
+             reader,
+             latest_age_ms: None,
+             accepted_epoch: None,
+             fusion: None,
+         };
+-        Ok(Self::with_trunk_imu(bus, calibration, imu))
++        let mut io = Self::with_trunk_imu(bus, calibration, imu);
++        io.head_compensation = head_compensation;
++        Ok(io)
+     }
+     fn with_trunk_imu(bus: Bus, calibration: Calibration, imu: TrunkImu) -> Self {
+         Self {
+@@ -2253,6 +2266,7 @@ impl FeetechIo {
+             imu_observation: None,
+             calibration,
+             imu,
++            head_compensation: None,
+             latest_ready: false,
+             latest_slow: None,
+             latest_sample_at: None,
+@@ -2404,6 +2418,12 @@ impl FeetechIo {
+             }
+         }
+         let mut blocks = result?;
++        if let Some(head) = self.head_compensation.as_mut() {
++            let samples = blocks.iter().filter(|(id, _)| (30..=33).contains(*id))
++                .map(|(id, bytes)| ServoSample::decode(bytes).map(|sample| (*id, sample)))
++                .collect::<Result<Vec<_>>>()?;
++            head.observe(samples.iter().map(|(id, sample)| (*id, sample)), Instant::now())?;
++        }
+         let (imu, raw_imu, host_age) = match &mut self.imu {
+             TrunkImu::Bus {
+                 decoder, freshness, ..
+@@ -2425,7 +2445,12 @@ impl FeetechIo {
+                 fusion,
+                 ..
+             } => {
+-                let sample = gate.check(reader.latest(), Instant::now())?;
++                let now = Instant::now();
++                let sample = match self.head_compensation.as_ref() {
++                    Some(head) => Some(head.compensate(reader.latest(), &self.calibration, now)?),
++                    None => reader.latest(),
++                };
++                let sample = gate.check(sample, now)?;
+                 if *accepted_epoch != Some(sample.epoch) {
+                     frame.restart_median();
+                     *accepted_epoch = Some(sample.epoch);
+@@ -4549,6 +4574,53 @@ mod hd1910_transport_tests {
+         }
+     }
+ 
++    /// The moving-head path uses real encoder telemetry, never probes ID 200 or enables torque.
++    #[test]
++    #[ignore = "requires MICRODUCK_HEAD_CORE_TEST_LIB pointing to the host ABI-v1 library"]
++    fn moving_head_uses_bracketed_feedback_without_id_200_or_motion() {
++        struct HeadHost { library: String, sequence: std::sync::atomic::AtomicU32 }
++        impl HostImu for HeadHost {
++            /// Identify this raw stream as the moving HAT source.
++            fn kind(&self) -> TrunkImuKind { TrunkImuKind::HeadBmi088 }
++            /// Provide a stationary upright sample 10 ms behind the current encoder transaction.
++            fn latest(&self) -> Option<crate::trunk_imu::HostImuSample> {
++                let now = Instant::now();
++                Some(crate::trunk_imu::HostImuSample {
++                    quat: [std::f64::consts::FRAC_1_SQRT_2, 0.0, -std::f64::consts::FRAC_1_SQRT_2, 0.0],
++                    gyro: [0.0; 3], received_at: now - Duration::from_millis(10),
++                    sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
++                    epoch: 1, epoch_started_at: now - Duration::from_secs(5), accuracy: None, fusion: None,
++                })
++            }
++            /// This deterministic test has no reader faults.
++            fn health(&self) -> HostImuHealth { HostImuHealth::default() }
++            /// Load the compiled core used by the other ABI tests.
++            fn head_estimator_library(&self) -> Option<&str> { Some(&self.library) }
++        }
++        let (bus, device) = emulator(false);
++        let reader = HeadHost {
++            library: std::env::var("MICRODUCK_HEAD_CORE_TEST_LIB").expect("test library path"),
++            sequence: std::sync::atomic::AtomicU32::new(1),
++        };
++        let mut io = FeetechIo::for_startup_with_imu(bus, calibration(), Box::new(reader)).unwrap();
++        assert!(io.read().is_err(), "one encoder frame cannot bracket an IMU sample");
++        let mut valid = 0;
++        for _ in 0..30 {
++            std::thread::sleep(Duration::from_millis(20));
++            if let Ok(sensors) = io.read() {
++                valid += 1;
++                assert!(sensors.imu.gravity[0].abs() < 1e-10);
++                assert!(sensors.imu.gravity[1].abs() < 1e-10);
++                assert!((sensors.imu.gravity[2] + 1.0).abs() < 1e-10);
++            }
++        }
++        assert!(valid >= 25, "expected a converged head source, got {valid} valid samples");
++        assert!(io.imu_ready());
++        assert!(io.set_torque(true).is_err(), "a body mount does not certify the head mount");
++        assert!(device.writes.lock().unwrap().is_empty(), "the diagnostic must not write motors");
++        assert!(device.requests.lock().unwrap().iter().all(|(_, _, ids)| !ids.contains(&IMU_ID)));
++    }
++
+     /// A BNO08x sample's gyro-fusion view reaches the snapshot in the trunk's axes, under the
+     /// mount the tick's own orientation went through — the other orientation in each mode. The
+     /// bus board has none, and busStatus does not change shape for it.
+diff --git a/microduck-hd1910/firmware/duck-control/src/lib.rs b/microduck-hd1910/firmware/duck-control/src/lib.rs
+index 97f91e2..fa0dd62 100644
+--- a/microduck-hd1910/firmware/duck-control/src/lib.rs
++++ b/microduck-hd1910/firmware/duck-control/src/lib.rs
+@@ -15,6 +15,7 @@ pub mod feetech;
+ pub mod feetech_snapshot;
+ pub mod full_q4;
+ pub mod gyro_fusion;
++pub mod head_compensation;
+ pub mod hardware;
+ pub mod imu;
+ pub mod io;
+diff --git a/microduck-hd1910/firmware/duck-control/src/trunk_imu.rs b/microduck-hd1910/firmware/duck-control/src/trunk_imu.rs
+index 6289de9..b07bb64 100644
+--- a/microduck-hd1910/firmware/duck-control/src/trunk_imu.rs
++++ b/microduck-hd1910/firmware/duck-control/src/trunk_imu.rs
+@@ -34,10 +34,12 @@ pub enum TrunkImuKind {
+     Bus,
+     Bno08x,
+     Lsm6dsv16x,
++    #[serde(rename = "head_bmi088")]
++    HeadBmi088,
+ }
+ 
+ impl TrunkImuKind {
+-    pub const ALL: [Self; 3] = [Self::Bus, Self::Bno08x, Self::Lsm6dsv16x];
++    pub const ALL: [Self; 4] = [Self::Bus, Self::Bno08x, Self::Lsm6dsv16x, Self::HeadBmi088];
+ 
+     /// The name configuration and diagnostics use for it.
+     pub fn label(self) -> &'static str {
+@@ -45,6 +47,7 @@ impl TrunkImuKind {
+             Self::Bus => "bus",
+             Self::Bno08x => "bno08x",
+             Self::Lsm6dsv16x => "lsm6dsv16x",
++            Self::HeadBmi088 => "head_bmi088",
+         }
+     }
+ 
+@@ -56,6 +59,7 @@ impl TrunkImuKind {
+             // A breakout has no standard way up. Identity says "unknown" honestly: it is
+             // only ever a starting point, and motion waits for a verified mount anyway.
+             Self::Lsm6dsv16x => [1.0, 0.0, 0.0, 0.0],
++            Self::HeadBmi088 => [1.0, 0.0, 0.0, 0.0],
+         }
+     }
+ }
+@@ -173,6 +177,8 @@ pub trait HostImu: Send + Sync {
+     /// The newest sample, or `None` before the first one.
+     fn latest(&self) -> Option<HostImuSample>;
+     fn health(&self) -> HostImuHealth;
++    /// ABI-v1 core for moving-head compensation; fixed-body readers need none.
++    fn head_estimator_library(&self) -> Option<&str> { None }
+ }
+ 
+ /// Oldest sample a tick may use. The bus board's bound too: status age plus transaction time
+@@ -373,7 +379,7 @@ mod tests {
+             [1.0, 0.0, 0.0, 0.0]
+         );
+         let labels: Vec<_> = TrunkImuKind::ALL.iter().map(|k| k.label()).collect();
+-        assert_eq!(labels, ["bus", "bno08x", "lsm6dsv16x"]);
++        assert_eq!(labels, ["bus", "bno08x", "lsm6dsv16x", "head_bmi088"]);
+         for kind in TrunkImuKind::ALL {
+             assert_eq!(
+                 serde_json::to_value(kind).unwrap(),
+diff --git a/microduck-hd1910/firmware/robotd-params/src/lib.rs b/microduck-hd1910/firmware/robotd-params/src/lib.rs
+index 579aa2e..eeb06c9 100644
+--- a/microduck-hd1910/firmware/robotd-params/src/lib.rs
++++ b/microduck-hd1910/firmware/robotd-params/src/lib.rs
+@@ -2092,10 +2092,13 @@ pub enum TrunkImuSource {
+     Bno08x,
+     /// An LSM6DSV16X breakout — the bus board's own chip — on the board's I²C, likewise.
+     Lsm6dsv16x,
++    /// HAT BMI088 in the moving head, via tofd plus measured encoder compensation.
++    #[serde(rename = "head_bmi088")]
++    HeadBmi088,
+ }
+ 
+ impl TrunkImuSource {
+-    pub const ALL: [Self; 3] = [Self::Bus, Self::Bno08x, Self::Lsm6dsv16x];
++    pub const ALL: [Self; 4] = [Self::Bus, Self::Bno08x, Self::Lsm6dsv16x, Self::HeadBmi088];
+ 
+     /// What the file says for it.
+     pub fn label(self) -> &'static str {
+@@ -2103,6 +2106,7 @@ impl TrunkImuSource {
+             Self::Bus => "bus",
+             Self::Bno08x => "bno08x",
+             Self::Lsm6dsv16x => "lsm6dsv16x",
++            Self::HeadBmi088 => "head_bmi088",
+         }
+     }
+ 
+@@ -2110,6 +2114,7 @@ impl TrunkImuSource {
+     pub fn i2c_addresses(self) -> &'static [u8] {
+         match self {
+             Self::Bus => &[],
++            Self::HeadBmi088 => &[],
+             // SA0 low / high.
+             Self::Bno08x => &[0x4A, 0x4B],
+             Self::Lsm6dsv16x => &[0x6A, 0x6B],
+@@ -2153,6 +2158,10 @@ impl Bno08xFusion {
+ #[serde(deny_unknown_fields, default)]
+ pub struct TrunkImuParams {
+     pub source: TrunkImuSource,
++    /// Existing tofd socket. This reader subscribes; tofd retains sole I2C ownership.
++    pub head_socket: String,
++    /// Versioned local C++ library implementing the head compensation ABI v1.
++    pub head_estimator_library: String,
+     /// The i2c-dev node a module source is read through. `/dev/i2c-4` is the Zero 3W header's
+     /// I²C once the `i2c4` overlay is enabled.
+     pub i2c_device: String,
+@@ -2172,6 +2181,8 @@ impl Default for TrunkImuParams {
+     fn default() -> Self {
+         Self {
+             source: TrunkImuSource::Bus,
++            head_socket: "/run/tofd/tof.sock".into(),
++            head_estimator_library: "/opt/microduck/local-components/head-body-v1/libmicroduck_head_body.so".into(),
+             i2c_device: "/dev/i2c-4".into(),
+             i2c_address: 0x4B,
+             bno08x_fusion: Bno08xFusion::Chip,
+@@ -2201,6 +2212,10 @@ impl TrunkImuParams {
+                     .to_owned(),
+             );
+         }
++        if self.source == TrunkImuSource::HeadBmi088 {
++            return (!self.head_socket.starts_with('/') || !self.head_estimator_library.starts_with('/'))
++                .then(|| "head_socket and head_estimator_library must be absolute paths".to_owned());
++        }
+         if self.i2c_device.trim().is_empty() {
+             return Some("i2c_device is empty".to_owned());
+         }
+@@ -3926,6 +3941,20 @@ source = \"{}\"
+         }
+     }
+ 
++    /// Head data use explicit local socket/library paths and never inherit I2C constraints.
++    #[test]
++    fn head_bmi088_requires_local_paths_and_feetech() {
++        let mut config = TrunkImuParams { source: TrunkImuSource::HeadBmi088, ..TrunkImuParams::default() };
++        config.i2c_device.clear();
++        config.i2c_address = 0;
++        assert!(config.problem(BusProtocol::Feetech).is_none());
++        config.head_socket = "relative.sock".into();
++        assert!(config.problem(BusProtocol::Feetech).is_some());
++        config.head_socket = "/run/tofd/tof.sock".into();
++        config.head_estimator_library = "http://untrusted/library".into();
++        assert!(config.problem(BusProtocol::Feetech).is_some());
++    }
++
+     /// A BNO08x publishes its own orientation unless told otherwise; `gyro` is the only other
+     /// word, the editor offers both under those names, and the key is inert on any other
+     /// source.
+diff --git a/microduck-hd1910/firmware/robotd-params/src/registry.rs b/microduck-hd1910/firmware/robotd-params/src/registry.rs
+index b4b12e5..89c99ae 100644
+--- a/microduck-hd1910/firmware/robotd-params/src/registry.rs
++++ b/microduck-hd1910/firmware/robotd-params/src/registry.rs
+@@ -141,7 +141,7 @@ pub const REGISTRY: &[Entry] = &[
+     // flipping it without commissioning the new sensor's mount leaves motion refused.
+     entry(
+         "trunk_imu.source",
+-        Kind::Choice(&["bus", "bno08x", "lsm6dsv16x"]),
++        Kind::Choice(&["bus", "bno08x", "lsm6dsv16x", "head_bmi088"]),
+         "Trunk IMU: the servo-bus board, or a BNO08x / LSM6DSV16X module on I²C (needs bus.protocol feetech)",
+     ),
+     entry(
+@@ -159,6 +159,8 @@ pub const REGISTRY: &[Entry] = &[
+         Kind::Choice(&["chip", "gyro"]),
+         "BNO08x: publish the chip's orientation, or the host's gyro-integrated one",
+     ),
++    entry("trunk_imu.head_socket", Kind::Text, "Head BMI088: existing tofd Unix socket"),
++    entry("trunk_imu.head_estimator_library", Kind::Text, "Head BMI088: local ABI-v1 compensation library"),
+     entry(
+         "trunk_imu.bno08x_raw_log",
+         Kind::Text,
+diff --git a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+index 8ffebfe..a59c1b5 100644
+--- a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::sync::oneshot;
+ 
+-pub const BUILD: &str = "replica-imu-verify-control.48";
++pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.1";
+ const MAX_PENDING: usize = 16;
+ const POSITION_TOLERANCE: u16 = 8;
+ const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
+@@ -1173,6 +1173,10 @@ fn process_job(
+             confirmed,
+             mount_wxyz,
+         } => {
++            if imu.source == TrunkImuKind::HeadBmi088 {
++                let _ = job.reply.send(Err("head_bmi088 needs sensor-to-head-site mounting and head-joint direction validation with the torso fixed; fixed-body verify-imu cannot certify it".into()));
++                return;
++            }
+             let result = if confirmed {
+                 let mount = if mount_wxyz.is_empty() {
+                     calibration.imu_mount(imu.source).quat
+@@ -1477,6 +1481,10 @@ pub async fn run(
+     host_imu: Option<&dyn HostImu>,
+ ) {
+     let source = host_imu.map_or(TrunkImuKind::Bus, |host| host.kind());
++    let mut head_compensation = match host_imu.map(duck_control::head_compensation::HeadCompensation::for_reader).transpose() {
++        Ok(compensation) => compensation.flatten(),
++        Err(error) => { tracing::error!(%error, "cannot load head compensation"); return; }
++    };
+     state.imu_ready.store(false, Ordering::Relaxed);
+     let mut calibration = match read_calibration(calibration_path) {
+         Ok(c) => c,
+@@ -1570,7 +1578,7 @@ pub async fn run(
+     let mut hold: Option<Hold> = None;
+     let mut off_pending = None;
+     let mut imu_decoder = TrunkFrame::new(calibration.imu_mount_quat);
+-    let mut imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
++    let mut imu_frame = TrunkFrame::new(calibration.control_imu_mount(source));
+     let mut imu_gate = HostImuGate::default();
+     let mut imu_epoch = None;
+     let mut raw_reading = None;
+@@ -1610,8 +1618,12 @@ pub async fn run(
+             }
+             if let Some(host) = host_imu {
+                 let now = Instant::now();
++                let latest = if let Some(head) = head_compensation.as_mut() {
++                    head.observe(samples.iter().map(|(id, sample)| (*id, sample)), now).map_err(|error| error.to_string())?;
++                    Some(head.compensate(host.latest(), &calibration, now).map_err(|error| error.to_string())?)
++                } else { host.latest() };
+                 let before = imu_gate.stale();
+-                let checked = imu_gate.check(host.latest(), now);
++                let checked = imu_gate.check(latest, now);
+                 let after = imu_gate.stale();
+                 state
+                     .imu_stale_blocks
+@@ -1838,7 +1850,7 @@ pub async fn run(
+                 }
+                 if old_mount != calibration.imu_mount(source).quat {
+                     imu_decoder = TrunkFrame::new(calibration.imu_mount_quat);
+-                    imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
++                    imu_frame = TrunkFrame::new(calibration.control_imu_mount(source));
+                 }
+             }
+             step_motion(&mut bus, &samples, &ids, &mut motion, &mut off_pending);
+@@ -1885,7 +1897,7 @@ pub async fn run(
+                             ))));
+                         if old_mount != calibration.imu_mount(source).quat {
+                             imu_decoder = TrunkFrame::new(calibration.imu_mount_quat);
+-                            imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
++                            imu_frame = TrunkFrame::new(calibration.control_imu_mount(source));
+                         }
+                     }
+                     let _ = pending.reply.send(result);
+diff --git a/microduck-hd1910/firmware/robotd/src/feetech_read_only.rs b/microduck-hd1910/firmware/robotd/src/feetech_read_only.rs
+index 86a47ea..07a94f7 100644
+--- a/microduck-hd1910/firmware/robotd/src/feetech_read_only.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_read_only.rs
+@@ -123,6 +123,9 @@ fn host_imu_report(
+     let checked = gate.check(latest, now);
+     let mut report = json!({"source": host.kind().label(), "valid": checked.is_ok(),
+         "reader": host.health()});
++    // Raw diagnostic mode does not claim that an uncompensated head sample is a body pose.
++    report["frame_name"] = json!("sensor");
++    report["head_compensated"] = json!(false);
+     if let Some(sample) = latest {
+         report["sequence"] = json!(sample.sequence);
+         report["epoch"] = json!(sample.epoch);
+diff --git a/microduck-hd1910/firmware/robotd/src/main.rs b/microduck-hd1910/firmware/robotd/src/main.rs
+index a5d8aff..6d9451d 100644
+--- a/microduck-hd1910/firmware/robotd/src/main.rs
++++ b/microduck-hd1910/firmware/robotd/src/main.rs
+@@ -39,6 +39,8 @@ mod telemetry_geometry;
+ mod telemetry_system;
+ mod theremin;
+ mod trunk_imu_i2c;
++mod host_imu;
++mod head_imu_reader;
+ mod trunk_imu_raw_log;
+ 
+ use std::path::{Path, PathBuf};
+@@ -1339,7 +1341,7 @@ fn spawn_control_thread(
+             let host_imu = if fake || sim.is_some() {
+                 None
+             } else {
+-                match trunk_imu_i2c::spawn_for(&params.trunk_imu) {
++                match host_imu::spawn_for(&params.trunk_imu) {
+                     None => None,
+                     Some(Ok(reader)) => {
+                         // What a BNO08x publishes is the one thing here that changes the
+@@ -1355,7 +1357,7 @@ fn spawn_control_thread(
+                             address = params.trunk_imu.i2c_address,
+                             bno08x_fusion = fusion.unwrap_or("-"),
+                             bno08x_raw_log = raw_log,
+-                            "trunk IMU is a module on I2C; ID 200 is not read"
++                            "configured host IMU reader started; ID 200 is not read"
+                         );
+                         Some(reader)
+                     }
+@@ -1526,7 +1528,7 @@ type BusIo = FakeIo;
+ /// belongs to whichever attempt succeeds.
+ async fn open_bus_waiting(
+     bus: &params::Bus,
+-    host_imu: Option<&trunk_imu_i2c::TrunkImuReader>,
++    host_imu: Option<&host_imu::HostReader>,
+     state: &RobotState,
+ ) -> Option<BusIo> {
+     let mut attempt = 0u32;
+@@ -1550,7 +1552,7 @@ async fn open_bus_waiting(
+ #[cfg(target_os = "linux")]
+ fn open_bus(
+     bus: &params::Bus,
+-    host_imu: Option<&trunk_imu_i2c::TrunkImuReader>,
++    host_imu: Option<&host_imu::HostReader>,
+     attempt: u32,
+     state: Option<&RobotState>,
+ ) -> Option<BusIo> {
+@@ -1752,7 +1754,7 @@ fn adopt_missing_servo(io: &mut duck_control::bus::DynamixelIo, loud: bool) -> b
+ #[cfg(not(target_os = "linux"))]
+ fn open_bus(
+     _bus: &params::Bus,
+-    _host_imu: Option<&trunk_imu_i2c::TrunkImuReader>,
++    _host_imu: Option<&host_imu::HostReader>,
+     _attempt: u32,
+     _state: Option<&RobotState>,
+ ) -> Option<BusIo> {
+diff --git a/microduck-hd1910/firmware/robotd/src/trunk_imu_i2c.rs b/microduck-hd1910/firmware/robotd/src/trunk_imu_i2c.rs
+index 6e06874..08506a1 100644
+--- a/microduck-hd1910/firmware/robotd/src/trunk_imu_i2c.rs
++++ b/microduck-hd1910/firmware/robotd/src/trunk_imu_i2c.rs
+@@ -45,6 +45,7 @@ pub fn kind_of(source: TrunkImuSource) -> TrunkImuKind {
+         TrunkImuSource::Bus => TrunkImuKind::Bus,
+         TrunkImuSource::Bno08x => TrunkImuKind::Bno08x,
+         TrunkImuSource::Lsm6dsv16x => TrunkImuKind::Lsm6dsv16x,
++        TrunkImuSource::HeadBmi088 => TrunkImuKind::HeadBmi088,
+     }
+ }
+ 
+@@ -79,7 +80,7 @@ impl ReaderOptions {
+ /// Start the reader `[trunk_imu]` asks for; `None` when the trunk IMU is the bus board.
+ pub fn spawn_for(params: &TrunkImuParams) -> Option<io::Result<TrunkImuReader>> {
+     let kind = kind_of(params.source);
+-    (kind != TrunkImuKind::Bus).then(|| {
++    matches!(kind, TrunkImuKind::Bno08x | TrunkImuKind::Lsm6dsv16x).then(|| {
+         TrunkImuReader::spawn(
+             kind,
+             &params.i2c_device,
+@@ -849,6 +850,7 @@ fn machine(
+         // `spawn_for` never starts a reader for the bus board; treated as the LSM's sibling
+         // rather than a panic, and the bring-up's identity check fails it with a reason.
+         TrunkImuKind::Lsm6dsv16x | TrunkImuKind::Bus => Box::new(Lsm6dsv16x::new(epoch, now)),
++        TrunkImuKind::HeadBmi088 => unreachable!("head BMI088 is read through tofd, never I2C"),
+     }
+ }
+ 
+diff --git a/microduck-hd1910/firmware/duck-control/src/head_compensation.rs b/microduck-hd1910/firmware/duck-control/src/head_compensation.rs
+new file mode 100644
+--- /dev/null
++++ b/microduck-hd1910/firmware/duck-control/src/head_compensation.rs
+@@ -0,0 +1,343 @@
++//! Moving-head BMI088 adapter. Encoder history is local to each control consumer;
++//! the separately versioned C++ core owns the kinematics and timestamp checks.
++//! No successful estimate grants motion permission: Calibration remains authoritative.
++
++use std::collections::VecDeque;
++use std::time::Instant;
++
++use crate::feetech::{Calibration, ServoSample};
++use crate::io::{IoError, Result};
++use crate::trunk_imu::{HostImu, HostImuSample, TrunkImuKind};
++
++const HEAD_IDS: [u8; 4] = [30, 31, 32, 33];
++
++/// ABI v1 input, matching head_body_estimator.h; units are radians and monotonic ns.
++#[repr(C)]
++#[derive(Default)]
++struct HeadInput {
++    version: u32,
++    mount_verified: u32,
++    joints_verified: u32,
++    reserved: u32,
++    now_ns: u64,
++    imu_ns: u64,
++    joint_ns: u64,
++    velocity_ns: u64,
++    quat: [f64; 4],
++    gyro: [f64; 3],
++    angles: [f64; 4],
++    velocities: [f64; 4],
++    sensor_to_site: [f64; 4],
++}
++
++/// ABI v1 output; status and availability must be checked before using any numbers.
++#[repr(C)]
++#[derive(Default)]
++struct BodyEstimate {
++    version: u32,
++    status: u32,
++    available: u32,
++    motion_authorized: u32,
++    quat: [f64; 4],
++    gyro: [f64; 3],
++    gravity: [f64; 3],
++    sensor_to_body: [f64; 4],
++    relative_gyro: [f64; 3],
++}
++
++/// Two complete, measured head encoder packets bracketing the IMU sample.
++#[repr(C)]
++#[derive(Default)]
++struct EncoderPair {
++    previous: [i32; 4],
++    current: [i32; 4],
++    direction: [i32; 4],
++    zero: [i32; 4],
++    previous_ns: u64,
++    current_ns: u64,
++}
++
++type Estimate =
++    unsafe extern "C" fn(*const HeadInput, *const EncoderPair, *mut BodyEstimate) -> i32;
++
++/// A complete head encoder observation, timestamped after its bus transaction.
++struct EncoderFrame {
++    at: Instant,
++    raw: [i32; 4],
++}
++
++/// Bounded history plus a loaded, immutable ABI-v1 library. No socket or bus ownership.
++pub struct HeadCompensation {
++    // Keep the code mapped until after the function pointer is no longer usable.
++    _library: libloading::Library,
++    estimate: Estimate,
++    origin: Instant,
++    history: VecDeque<EncoderFrame>,
++}
++
++/// Preserve the controller's existing IMU-failure classification.
++fn refused(reason: impl std::fmt::Display) -> IoError {
++    IoError::Bus(format!(
++        "Feetech IMU not ready or stale (head_bmi088: {reason})"
++    ))
++}
++
++impl HeadCompensation {
++    /// Load once for this consumer; other IMU sources do not load the head library.
++    pub fn for_reader(reader: &dyn HostImu) -> Result<Option<Self>> {
++        if reader.kind() != TrunkImuKind::HeadBmi088 {
++            return Ok(None);
++        }
++        let path = reader
++            .head_estimator_library()
++            .ok_or_else(|| refused("missing estimator library path"))?;
++        // The path comes from explicit local configuration, never a network sample.
++        let library = unsafe { libloading::Library::new(path) }.map_err(refused)?;
++        let estimate = unsafe {
++            *library
++                .get::<Estimate>(b"microduck_estimate_encoders\0")
++                .map_err(refused)?
++        };
++        Ok(Some(Self {
++            _library: library,
++            estimate,
++            origin: Instant::now(),
++            history: VecDeque::with_capacity(8),
++        }))
++    }
++
++    /// Keep a complete packet only. Missing head joints invalidate the interpolation history.
++    pub fn observe<'a>(
++        &mut self,
++        samples: impl Iterator<Item = (u8, &'a ServoSample)>,
++        at: Instant,
++    ) -> Result<()> {
++        let mut raw = [None; 4];
++        for (id, sample) in samples {
++            if let Some(index) = HEAD_IDS.iter().position(|head_id| *head_id == id) {
++                raw[index] = Some(sample.feedback.position_raw);
++            }
++        }
++        if raw.iter().any(Option::is_none) {
++            self.history.clear();
++            return Err(refused("incomplete head encoder packet"));
++        }
++        if self
++            .history
++            .back()
++            .is_some_and(|previous| at <= previous.at)
++        {
++            self.history.clear();
++            return Err(refused("non-increasing encoder timestamp"));
++        }
++        if self.history.len() == 8 {
++            self.history.pop_front();
++        }
++        self.history.push_back(EncoderFrame {
++            at,
++            raw: raw.map(Option::unwrap),
++        });
++        Ok(())
++    }
++
++    /// Interpolate measured encoders around the source-clock IMU sample, never extrapolate.
++    /// Unverified calibration permits a diagnostic estimate but cannot pass motion startup.
++    pub fn compensate(
++        &self,
++        sample: Option<HostImuSample>,
++        calibration: &Calibration,
++        now: Instant,
++    ) -> Result<HostImuSample> {
++        let mut sample = sample.ok_or_else(|| refused("no head IMU sample"))?;
++        let (previous, current) = self
++            .history
++            .iter()
++            .zip(self.history.iter().skip(1))
++            .find(|(a, b)| a.at <= sample.received_at && sample.received_at <= b.at)
++            .ok_or_else(|| refused("waiting for encoder packets around IMU timestamp"))?;
++        let ns = |at: Instant| -> Result<u64> {
++            at.checked_duration_since(self.origin)
++                .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
++                .ok_or_else(|| refused("sample predates encoder history"))
++        };
++        let mount = calibration.imu_mount(TrunkImuKind::HeadBmi088);
++        let mut pair = EncoderPair {
++            previous: previous.raw,
++            current: current.raw,
++            previous_ns: ns(previous.at)?,
++            current_ns: ns(current.at)?,
++            ..EncoderPair::default()
++        };
++        let mut joints_verified = true;
++        for (index, id) in HEAD_IDS.iter().enumerate() {
++            let joint = calibration
++                .joints
++                .iter()
++                .find(|joint| joint.id == *id)
++                .ok_or_else(|| refused(format!("head joint ID {id} missing from calibration")))?;
++            pair.direction[index] = i32::from(joint.direction);
++            pair.zero[index] = i32::from(joint.zero_raw);
++            joints_verified &= joint.calibrated;
++        }
++        let input = HeadInput {
++            version: 1,
++            mount_verified: u32::from(mount.verified),
++            joints_verified: u32::from(joints_verified),
++            now_ns: ns(now)?,
++            imu_ns: ns(sample.received_at)?,
++            quat: sample.quat,
++            gyro: sample.gyro,
++            sensor_to_site: mount.quat,
++            ..HeadInput::default()
++        };
++        let mut output = BodyEstimate::default();
++        // POD layout is pinned by tests; the core has no IO, allocation or exceptions.
++        let status = unsafe { (self.estimate)(&input, &pair, &mut output) };
++        if !matches!(status, 0 | 1)
++            || output.version != 1
++            || output.available != 1
++            || output.status != status as u32
++            || output.motion_authorized != 0
++            || output
++                .quat
++                .iter()
++                .chain(output.gyro.iter())
++                .any(|v| !v.is_finite())
++        {
++            return Err(refused(format!(
++                "compensation refused, core status {status}"
++            )));
++        }
++        sample.quat = output.quat;
++        sample.gyro = output.gyro;
++        sample.fusion = None;
++        Ok(sample)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::trunk_imu::HostImuHealth;
++    use std::time::Duration;
++
++    /// Raw provider used only for the real-library ABI integration test.
++    struct TestReader(String);
++    impl HostImu for TestReader {
++        /// Select the moving-head source.
++        fn kind(&self) -> TrunkImuKind {
++            TrunkImuKind::HeadBmi088
++        }
++        /// Tests supply deterministic samples directly.
++        fn latest(&self) -> Option<HostImuSample> {
++            None
++        }
++        /// No background worker is involved in these tests.
++        fn health(&self) -> HostImuHealth {
++            HostImuHealth::default()
++        }
++        /// Use the separately compiled and verified host library.
++        fn head_estimator_library(&self) -> Option<&str> {
++            Some(&self.0)
++        }
++    }
++
++    /// Catch ABI drift before an ARM build is allowed to use the existing C++ library.
++    #[test]
++    fn layouts_match_cpp_abi_v1() {
++        assert_eq!(std::mem::size_of::<HeadInput>(), 200);
++        assert_eq!(std::mem::size_of::<EncoderPair>(), 80);
++        assert_eq!(std::mem::size_of::<BodyEstimate>(), 152);
++        assert_eq!(std::mem::offset_of!(HeadInput, quat), 48);
++        assert_eq!(std::mem::offset_of!(HeadInput, sensor_to_site), 168);
++        assert_eq!(std::mem::offset_of!(BodyEstimate, quat), 16);
++    }
++
++    /// Exercise the actual FFI and reject old data, extrapolation, missing packets and bad axes.
++    #[test]
++    #[ignore = "requires MICRODUCK_HEAD_CORE_TEST_LIB pointing to the host ABI-v1 library"]
++    fn cpp_core_is_used_with_bracketed_encoders_and_motion_stays_gated() {
++        let reader =
++            TestReader(std::env::var("MICRODUCK_HEAD_CORE_TEST_LIB").expect("test library path"));
++        let mut head = HeadCompensation::for_reader(&reader).unwrap().unwrap();
++        let origin = head.origin;
++        head.history.push_back(EncoderFrame {
++            at: origin + Duration::from_millis(10),
++            raw: [2048; 4],
++        });
++        head.history.push_back(EncoderFrame {
++            at: origin + Duration::from_millis(30),
++            raw: [2048; 4],
++        });
++        let mut calibration = Calibration::commissioning(crate::model::JOINT_IDS);
++        let sample = HostImuSample {
++            quat: [
++                std::f64::consts::FRAC_1_SQRT_2,
++                0.0,
++                -std::f64::consts::FRAC_1_SQRT_2,
++                0.0,
++            ],
++            gyro: [0.0; 3],
++            received_at: origin + Duration::from_millis(20),
++            sequence: 7,
++            epoch: 1,
++            epoch_started_at: origin,
++            accuracy: None,
++            fusion: None,
++        };
++        let body = head
++            .compensate(
++                Some(sample),
++                &calibration,
++                origin + Duration::from_millis(31),
++            )
++            .unwrap();
++        assert!((body.quat[0].abs() - 1.0).abs() < 1e-10);
++        assert!(body.quat[1..].iter().all(|value| value.abs() < 1e-10));
++        assert_eq!(body.gyro, [0.0; 3]);
++        assert_eq!(body.received_at, sample.received_at);
++        assert!(
++            calibration
++                .validate_motion_for(TrunkImuKind::HeadBmi088)
++                .is_err()
++        );
++        assert!(
++            head.compensate(
++                Some(sample),
++                &calibration,
++                origin + Duration::from_millis(80)
++            )
++            .is_err()
++        );
++        assert!(
++            head.compensate(
++                Some(HostImuSample {
++                    received_at: origin + Duration::from_millis(31),
++                    ..sample
++                }),
++                &calibration,
++                origin + Duration::from_millis(32)
++            )
++            .is_err()
++        );
++        calibration
++            .joints
++            .iter_mut()
++            .find(|joint| joint.id == 30)
++            .unwrap()
++            .direction = 0;
++        assert!(
++            head.compensate(
++                Some(sample),
++                &calibration,
++                origin + Duration::from_millis(31)
++            )
++            .is_err()
++        );
++        assert!(
++            head.observe(std::iter::empty(), origin + Duration::from_millis(40))
++                .is_err()
++        );
++        assert!(head.history.is_empty());
++    }
++}
+diff --git a/microduck-hd1910/firmware/robotd/src/head_imu_reader.rs b/microduck-hd1910/firmware/robotd/src/head_imu_reader.rs
+new file mode 100644
+--- /dev/null
++++ b/microduck-hd1910/firmware/robotd/src/head_imu_reader.rs
+@@ -0,0 +1,323 @@
++//! Read the HAT BMI088 from tofd without competing for its I2C device.
++//! Source CLOCK_MONOTONIC timestamps, not socket arrival time, determine freshness.
++
++use std::io::{self, BufRead, BufReader, Write};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use arc_swap::ArcSwapOption;
++use duck_control::trunk_imu::{HostImu, HostImuHealth, HostImuSample, TrunkImuKind};
++use serde::Deserialize;
++
++/// Values transported by the existing head_imu.frame endpoint; all are sensor-frame data.
++#[derive(Deserialize)]
++struct WireSample {
++    quat: [f64; 4],
++    gyro: [f64; 3],
++    seq: u64,
++    t_ns: u64,
++}
++
++/// Single-writer snapshot and reader lifecycle shared without giving the worker self-ownership.
++struct Shared {
++    latest: ArcSwapOption<HostImuSample>,
++    stop: AtomicBool,
++    health: Mutex<HostImuHealth>,
++}
++
++/// Last owner requests worker shutdown; the 200-ms socket timeout bounds its next read.
++struct Owner {
++    shared: Arc<Shared>,
++    library: String,
++}
++
++impl Drop for Owner {
++    /// Stop the worker when the last controller owner releases it.
++    fn drop(&mut self) {
++        self.shared.stop.store(true, Ordering::Relaxed);
++    }
++}
++
++/// Cheap cloned handles survive controller startup retries; one worker owns the socket.
++#[derive(Clone)]
++pub struct HeadImuReader(Arc<Owner>);
++
++impl HeadImuReader {
++    /// Start a bounded reconnecting worker; a missing tofd is a reported fault, never fake data.
++    pub fn spawn(socket: &str, library: &str) -> io::Result<Self> {
++        let shared = Arc::new(Shared {
++            latest: ArcSwapOption::empty(),
++            stop: AtomicBool::new(false),
++            health: Mutex::new(HostImuHealth {
++                state: "connecting",
++                ..HostImuHealth::default()
++            }),
++        });
++        let worker = shared.clone();
++        let socket = socket.to_owned();
++        std::thread::Builder::new()
++            .name("head-bmi088".into())
++            .spawn(move || run(worker, socket))?;
++        Ok(Self(Arc::new(Owner {
++            shared,
++            library: library.to_owned(),
++        })))
++    }
++}
++
++impl HostImu for HeadImuReader {
++    /// Distinguish a moving head sensor from fixed-body I2C modules in every diagnostic.
++    fn kind(&self) -> TrunkImuKind {
++        TrunkImuKind::HeadBmi088
++    }
++
++    /// Return raw sensor data; consumers must apply measured head encoder compensation.
++    fn latest(&self) -> Option<HostImuSample> {
++        self.0.shared.latest.load_full().map(|sample| *sample)
++    }
++
++    /// Health snapshots never wait behind a worker updating counters.
++    fn health(&self) -> HostImuHealth {
++        self.0
++            .shared
++            .health
++            .try_lock()
++            .map(|health| health.clone())
++            .unwrap_or_else(|_| HostImuHealth {
++                state: "updating",
++                ..HostImuHealth::default()
++            })
++    }
++
++    /// The immutable ABI-v1 core loaded by each consumer, outside the control loop.
++    fn head_estimator_library(&self) -> Option<&str> {
++        Some(&self.0.library)
++    }
++}
++
++/// Map tofd's monotonic source clock onto Instant while rejecting future and stale frames.
++fn source_instant(source_ns: u64, clock_ns: u64, now: Instant) -> io::Result<Instant> {
++    let age = clock_ns
++        .checked_sub(source_ns)
++        .filter(|age| *age <= 50_000_000)
++        .ok_or_else(|| {
++            io::Error::new(
++                io::ErrorKind::InvalidData,
++                "head sample future or older than 50 ms",
++            )
++        })?;
++    now.checked_sub(Duration::from_nanos(age))
++        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid source clock"))
++}
++
++/// Retry independently of the controller tick; each reconnect clears the last sample.
++fn run(shared: Arc<Shared>, socket: String) {
++    let mut epoch = 0u32;
++    while !shared.stop.load(Ordering::Relaxed) {
++        epoch = epoch.wrapping_add(1);
++        shared.latest.store(None);
++        if let Ok(mut health) = shared.health.lock() {
++            health.state = "connecting";
++            health.epoch = epoch;
++        }
++        if let Err(error) = stream(&shared, &socket, epoch) {
++            shared.latest.store(None);
++            if let Ok(mut health) = shared.health.lock() {
++                health.state = "reconnecting";
++                health.errors += 1;
++                health.last_error = Some(error.to_string());
++            }
++        }
++        for _ in 0..10 {
++            if shared.stop.load(Ordering::Relaxed) {
++                break;
++            }
++            std::thread::sleep(Duration::from_millis(50));
++        }
++    }
++    shared.latest.store(None);
++}
++
++/// Read newline JSON with a 64-KiB cap. A faulty writer cannot grow the buffer indefinitely.
++fn bounded_line(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
++    let mut line = Vec::with_capacity(1024);
++    loop {
++        let available = reader.fill_buf()?;
++        if available.is_empty() {
++            return Err(io::Error::new(
++                io::ErrorKind::UnexpectedEof,
++                "tofd disconnected",
++            ));
++        }
++        let count = available
++            .iter()
++            .position(|b| *b == b'\n')
++            .map_or(available.len(), |i| i + 1);
++        if line.len() + count > 65536 {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "tofd frame exceeds 64 KiB",
++            ));
++        }
++        line.extend_from_slice(&available[..count]);
++        reader.consume(count);
++        if line.last() == Some(&b'\n') {
++            return Ok(line);
++        }
++    }
++}
++
++/// Subscribe to the existing BMI088 stream. A timeout reconnects and creates a fresh epoch.
++#[cfg(unix)]
++fn stream(shared: &Shared, socket: &str, epoch: u32) -> io::Result<()> {
++    let mut socket = std::os::unix::net::UnixStream::connect(socket)?;
++    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
++    socket.set_write_timeout(Some(Duration::from_millis(200)))?;
++    socket.write_all(
++        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"head_imu.stream\",\"params\":{}}\n",
++    )?;
++    let mut reader = BufReader::new(socket);
++    let epoch_started_at = Instant::now();
++    let mut last_source_ns = None;
++    let mut last_sequence = None;
++    let mut accepted = false;
++    while !shared.stop.load(Ordering::Relaxed) {
++        let line = bounded_line(&mut reader)?;
++        let message: serde_json::Value = serde_json::from_slice(&line)?;
++        if message.get("id") == Some(&serde_json::json!(1)) {
++            accepted =
++                message["result"]["accepted"] == true && message["result"]["sensor"] == "BMI088";
++            if !accepted {
++                return Err(io::Error::other(format!(
++                    "tofd refused BMI088 subscription: {message}"
++                )));
++            }
++            continue;
++        }
++        if !accepted || message["method"] != "head_imu.frame" {
++            continue;
++        }
++        let wire: WireSample = serde_json::from_value(message["params"].clone())?;
++        if last_source_ns.is_some_and(|last| wire.t_ns <= last)
++            || last_sequence.is_some_and(|last| wire.seq <= last)
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "head IMU source sequence or clock restarted",
++            ));
++        }
++        let now = Instant::now();
++        let clock_ns = duck_ipc_proto::clock::monotonic_ns();
++        let received_at = source_instant(wire.t_ns, clock_ns, now)?;
++        let norm = wire.quat.iter().map(|value| value * value).sum::<f64>();
++        if !norm.is_finite()
++            || !(0.9..=1.1).contains(&norm)
++            || wire.gyro.iter().any(|value| !value.is_finite())
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "head IMU invalid quaternion or gyro",
++            ));
++        }
++        last_source_ns = Some(wire.t_ns);
++        last_sequence = Some(wire.seq);
++        shared.latest.store(Some(Arc::new(HostImuSample {
++            quat: wire.quat,
++            gyro: wire.gyro,
++            received_at,
++            sequence: wire.seq as u32,
++            epoch,
++            epoch_started_at,
++            accuracy: None,
++            fusion: None,
++        })));
++        if let Ok(mut health) = shared.health.lock() {
++            health.state = "streaming";
++            health.samples += 1;
++            health.last_error = None;
++        }
++    }
++    Ok(())
++}
++
++/// Non-Unix hosts can compile diagnostics but cannot attach to the board's Unix socket.
++#[cfg(not(unix))]
++fn stream(_shared: &Shared, _socket: &str, _epoch: u32) -> io::Result<()> {
++    Err(io::Error::new(
++        io::ErrorKind::Unsupported,
++        "head BMI088 requires a Unix socket",
++    ))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Arrival time must not revive buffered or future source data.
++    #[test]
++    fn source_clock_rejects_stale_and_future_samples() {
++        let now = Instant::now();
++        assert_eq!(
++            source_instant(90_000_000, 100_000_000, now).unwrap(),
++            now - Duration::from_millis(10)
++        );
++        assert!(source_instant(49_999_999, 100_000_000, now).is_err());
++        assert!(source_instant(100_000_001, 100_000_000, now).is_err());
++    }
++
++    /// Missing delimiters remain bounded, and split frames retain exact bytes.
++    #[test]
++    fn socket_lines_are_bounded() {
++        assert_eq!(bounded_line(&mut &b"abc\nnext\n"[..]).unwrap(), b"abc\n");
++        assert!(bounded_line(&mut &vec![b'x'; 65537][..]).is_err());
++        assert!(bounded_line(&mut &b"partial"[..]).is_err());
++    }
++
++    /// Exercise the real socket worker and source-time mapping without an I2C or servo device.
++    #[test]
++    #[cfg(unix)]
++    fn worker_reads_the_existing_tofd_wire_protocol() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("tof.sock");
++        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
++        let done = Arc::new(AtomicBool::new(false));
++        let server_done = done.clone();
++        let server = std::thread::spawn(move || {
++            let (mut stream, _) = listener.accept().unwrap();
++            stream
++                .set_write_timeout(Some(Duration::from_secs(1)))
++                .unwrap();
++            let mut request = BufReader::new(stream.try_clone().unwrap());
++            let message: serde_json::Value =
++                serde_json::from_slice(&bounded_line(&mut request).unwrap()).unwrap();
++            assert_eq!(message["method"], "head_imu.stream");
++            writeln!(stream, "{}", serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"accepted":true,"sensor":"BMI088","hz":50}})).unwrap();
++            let mut sequence = 0u64;
++            while !server_done.load(Ordering::Relaxed) {
++                sequence += 1;
++                let frame = serde_json::json!({"jsonrpc":"2.0","method":"head_imu.frame","params":{
++                    "seq":sequence,"t_ns":duck_ipc_proto::clock::monotonic_ns(),
++                    "quat":[1.0,0.0,0.0,0.0],"gyro":[0.01,0.02,0.03]}});
++                if writeln!(stream, "{frame}").is_err() {
++                    break;
++                }
++                std::thread::sleep(Duration::from_millis(20));
++            }
++        });
++        let reader = HeadImuReader::spawn(path.to_str().unwrap(), "/test/not-loaded.so").unwrap();
++        let deadline = Instant::now() + Duration::from_secs(2);
++        while reader.health().samples < 3 && Instant::now() < deadline {
++            std::thread::sleep(Duration::from_millis(10));
++        }
++        let observed = reader.latest();
++        done.store(true, Ordering::Relaxed);
++        drop(reader);
++        server.join().unwrap();
++        let observed = observed.expect("worker must publish real source frames");
++        assert!(observed.sequence >= 3);
++        assert_eq!(observed.quat, [1.0, 0.0, 0.0, 0.0]);
++        assert_eq!(observed.gyro, [0.01, 0.02, 0.03]);
++        assert!(Instant::now().duration_since(observed.received_at) < Duration::from_millis(100));
++    }
++}
+diff --git a/microduck-hd1910/firmware/robotd/src/host_imu.rs b/microduck-hd1910/firmware/robotd/src/host_imu.rs
+new file mode 100644
+--- /dev/null
++++ b/microduck-hd1910/firmware/robotd/src/host_imu.rs
+@@ -0,0 +1,54 @@
++//! Explicit host IMU source selection; never probes or substitutes a different sensor.
++use crate::params::{TrunkImuParams, TrunkImuSource};
++use duck_control::trunk_imu::{HostImu, HostImuHealth, HostImuSample, TrunkImuKind};
++use std::io;
++
++/// One clonable reader shared by startup retries, commissioning and the control loop.
++#[derive(Clone)]
++pub enum HostReader {
++    I2c(crate::trunk_imu_i2c::TrunkImuReader),
++    Head(crate::head_imu_reader::HeadImuReader),
++}
++
++impl HostReader {
++    /// Borrow the selected source without changing sensor-frame semantics.
++    fn reader(&self) -> &dyn HostImu {
++        match self {
++            Self::I2c(reader) => reader,
++            Self::Head(reader) => reader,
++        }
++    }
++}
++
++impl HostImu for HostReader {
++    /// Report the configured hardware source.
++    fn kind(&self) -> TrunkImuKind {
++        self.reader().kind()
++    }
++    /// Take a nonblocking raw sensor snapshot.
++    fn latest(&self) -> Option<HostImuSample> {
++        self.reader().latest()
++    }
++    /// Report the worker's state and errors.
++    fn health(&self) -> HostImuHealth {
++        self.reader().health()
++    }
++    /// Only the moving-head source supplies a compensation library.
++    fn head_estimator_library(&self) -> Option<&str> {
++        self.reader().head_estimator_library()
++    }
++}
++
++/// Start exactly the configured source. The bus IMU has no separate reader.
++pub fn spawn_for(params: &TrunkImuParams) -> Option<io::Result<HostReader>> {
++    if params.source == TrunkImuSource::HeadBmi088 {
++        return Some(
++            crate::head_imu_reader::HeadImuReader::spawn(
++                &params.head_socket,
++                &params.head_estimator_library,
++            )
++            .map(HostReader::Head),
++        );
++    }
++    crate::trunk_imu_i2c::spawn_for(params).map(|result| result.map(HostReader::I2c))
++}
