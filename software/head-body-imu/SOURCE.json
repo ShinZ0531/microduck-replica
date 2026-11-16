@@ -19,10 +19,16 @@
         "tracked_modified_files": 6,
         "new_files": 1,
         "purpose": "explicit user-driven head mounting and joint compensation verification; native proof-bound commit; API 44 local extension"
+      },
+      {
+        "path": "patches/standing-head-calibration.patch",
+        "tracked_modified_files": 5,
+        "new_files": 1,
+        "purpose": "powered standing collection, automatic bounded head tests, stop/lease handling; API45 and calibration ABI v2"
       }
     ],
-    "diagnostic_build": "replica-imu-verify-control.48-head-bmi088.3",
-    "api_version": 44
+    "diagnostic_build": "replica-imu-verify-control.48-head-bmi088.4",
+    "api_version": 45
   },
   "model": {
     "repository": "https://github.com/fanhao375/Microduck-kissqy",
@@ -36,7 +42,8 @@
     "motion_authorized": false,
     "physical_mount_verified": false,
     "walking_verified": false,
-    "head_calibration_supported": true
+    "head_calibration_supported": true,
+    "standing_head_test_supported": true
   },
   "legacy_sources": {
     "source/head_body_estimator.h": "1e9d56b759e01e85b4ea47f83fe599ed77d58e895ef4850e9d06cf2bc3f7caab",

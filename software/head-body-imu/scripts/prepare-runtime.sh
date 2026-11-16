@@ -10,6 +10,7 @@ patches=(
     "$component_dir/patches/head-bmi088.patch"
     "$component_dir/patches/runtime-hardening.patch"
     "$component_dir/patches/head-calibration.patch"
+    "$component_dir/patches/standing-head-calibration.patch"
 )
 
 if [[ $# -lt 1 || $# -gt 2 || ! -d "$runtime_dir" ]]; then

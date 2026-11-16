@@ -8,7 +8,7 @@
 #include <new>
 #include <stdexcept>
 
-static_assert(sizeof(MicroduckHeadCalibrationStatus) == 344, "Unexpected calibration ABI layout");
+static_assert(sizeof(MicroduckHeadCalibrationStatus) == 352, "Unexpected calibration ABI layout");
 
 namespace
 {
@@ -42,7 +42,9 @@ namespace
         std::array<Vector, 3> fitGravity{};
         std::array<double, 4> referenceAngles{};
         Rotation mount{1.0, 0.0, 0.0, 0.0};
-        Vector gravityReference{};
+        Vector gravityReference{0.0, 0.0, -1.0};
+        bool needsLevel = false;
+        unsigned int levelSamples = 0;
     };
 
     /** 计算三个轴的点积，用于单位向量及相对倾斜判定。 */
@@ -173,7 +175,7 @@ namespace
     std::deque<Frame> window(const Session& session)
     {
         std::deque<Frame> selected;
-        const bool moving = session.nextStep >= 4 && session.nextStep <= 7;
+        const bool moving = session.nextStep >= 6 && session.nextStep <= 9;
         const auto span = moving ? kMotionWindowNs : kStaticWindowNs;
         for (const Frame& frame : session.frames)
         {
@@ -221,7 +223,7 @@ namespace
                                                                : session.referenceAngles[joint];
                 if (std::abs(frame.aligned.jointAnglesRad[joint] - reference) * kDegrees > kStaticHeadDeg)
                 {
-                    throw std::runtime_error("求安装方向时头颈必须保持初始姿态，仅倾斜整个机身");
+                    throw std::runtime_error("站姿保持时头颈角度变化超过 2 度，请检查舵机是否保持到位；不需要手扶头部");
                 }
             }
         }
@@ -288,7 +290,13 @@ namespace
         double gyroSquared = 0.0;
         double gyroPeak = 0.0;
         Vector gravitySum{};
-        const bool moving = session.nextStep >= 4 && session.nextStep <= 7;
+        Vector residualSum{};
+        Vector relativeSum{};
+        unsigned int groupCount = 0;
+        unsigned int groups = 0;
+        double residualEnergy = 0.0;
+        double relativeEnergy = 0.0;
+        const bool moving = session.nextStep >= 6 && session.nextStep <= 9;
         const MicroduckBodyEstimate first = body(session, frames.front());
         const Rotation firstRotation{
             first.bodyToWorldWxyz[0], first.bodyToWorldWxyz[1], first.bodyToWorldWxyz[2], first.bodyToWorldWxyz[3]};
@@ -306,6 +314,18 @@ namespace
             {
                 squared += estimate.bodyGyroRadS[axis] * estimate.bodyGyroRadS[axis];
                 gravitySum[axis] += estimate.gravityInBody[axis];
+                residualSum[axis] += estimate.bodyGyroRadS[axis];
+                relativeSum[axis] += estimate.headRelativeGyroInBodyRadS[axis];
+            }
+            // 约 0.2 秒均值降低 count 差分噪声；相对能量检查可识别小幅运动中陀螺全零或方向错误。
+            if (++groupCount == 10)
+            {
+                residualEnergy += dot(residualSum, residualSum) / 100.0;
+                relativeEnergy += dot(relativeSum, relativeSum) / 100.0;
+                residualSum = {};
+                relativeSum = {};
+                groupCount = 0;
+                ++groups;
             }
             gyroSquared += squared;
             gyroPeak = std::max(gyroPeak, std::sqrt(squared));
@@ -320,11 +340,20 @@ namespace
         const Vector meanGravity = unit(gravitySum);
         if (moving)
         {
-            const int active = static_cast<int>(session.nextStep) - 4;
+            if (groups == 0 || relativeEnergy / groups < 0.0001)
+            {
+                throw std::runtime_error("头部测试角速度激励不足，不能证明角速度补偿有效");
+            }
+            status.gyroRelativeErrorRatio = std::sqrt(residualEnergy / relativeEnergy);
+            if (status.gyroRelativeErrorRatio > 0.5)
+            {
+                throw std::runtime_error("头部角速度相对残差超过 50%，请检查 IMU 陀螺、方向及机身是否晃动");
+            }
+            const int active = static_cast<int>(session.nextStep) - 6;
             status.headSpanDeg = (maximum[active] - minimum[active]) * kDegrees;
             if (status.headSpanDeg < kMinimumHeadSpanDeg)
             {
-                throw std::runtime_error("该头颈关节变化不足 8 度，请固定躯干、小幅缓慢往返转动后立即点采集");
+                throw std::runtime_error("自动测试关节的实测行程不足 8 度，请检查目标跟随和机械干涉");
             }
             for (int joint = 0; joint < 4; ++joint)
             {
@@ -351,7 +380,7 @@ namespace
         {
             throw std::runtime_error("姿态复核仍在晃动，请停稳至少 2 秒");
         }
-        if (session.nextStep == 3)
+        if (session.nextStep == 5)
         {
             if (angle(meanGravity, {0.0, 0.0, -1.0}) > 5.0)
             {
@@ -364,7 +393,7 @@ namespace
         const double heading =
             std::atan2(meanGravity[1] - session.gravityReference[1], meanGravity[0] - session.gravityReference[0]) *
             kDegrees;
-        const double expected = session.nextStep == 8 ? 0.0 : 90.0;
+        const double expected = -90.0; // 第 4 步右倾是未参与安装求解的独立复核。
         const double error = std::abs(std::remainder(heading - expected, 360.0));
         if (tilt < 12.0 || tilt > 35.0 || error > 20.0)
         {
@@ -379,9 +408,13 @@ namespace
         {
             throw std::runtime_error("校验步骤已改变，请按当前提示继续，不可跳步");
         }
+        if (session.needsLevel)
+        {
+            throw std::runtime_error("请先回到站姿端平，停半秒后再按提示倾斜整机");
+        }
         const auto frames = window(session);
         requireWindow(frames, status);
-        if (step < 3)
+        if (step < 4)
         {
             const Vector measured = staticGravity(session, frames);
             if (step > 0)
@@ -392,7 +425,20 @@ namespace
                     throw std::runtime_error("机身倾斜须为 12–35 度，头颈保持不变，再停稳 2 秒");
                 }
             }
-            session.fitGravity[step] = measured;
+            if (step == 2)
+            {
+                const Vector up{-session.fitGravity[0][0], -session.fitGravity[0][1], -session.fitGravity[0][2]};
+                const Vector forward = horizontal(session.fitGravity[1], up);
+                const Vector backward = horizontal(measured, up);
+                if (angle(forward, {-backward[0], -backward[1], -backward[2]}) > 20.0)
+                {
+                    throw std::runtime_error("后倾方向与前倾不相反，请先回正再向机身后方倾斜");
+                }
+            }
+            else
+            {
+                session.fitGravity[step == 3 ? 2 : step] = measured;
+            }
             if (step == 0)
             {
                 for (int joint = 0; joint < 4; ++joint)
@@ -405,7 +451,7 @@ namespace
                     session.referenceAngles[joint] = sum / frames.size();
                 }
             }
-            if (step == 2)
+            if (step == 3)
             {
                 solveMount(session);
             }
@@ -415,6 +461,8 @@ namespace
             verify(session, frames, status);
         }
         ++session.nextStep;
+        session.needsLevel = step < 4;
+        session.levelSamples = 0;
         session.frames.clear();
     }
 } // namespace
@@ -468,8 +516,21 @@ int microduck_head_calibration_observe(void* handle,
         if (session.lastNs != 0 && aligned.imuSampleNs - session.lastNs > kMaximumGapNs)
         {
             session.frames.clear();
+            session.levelSamples = 0;
         }
         session.lastNs = aligned.imuSampleNs;
+        // 四向倾斜复用旧向导的“先回正”交互；判断相对重力夹角，不依赖尚未校准的轴标签。
+        if (session.needsLevel)
+        {
+            const bool level = angle(gravity(aligned.sensorToWorldWxyz), session.fitGravity[0]) <= 5.0;
+            session.levelSamples = level ? session.levelSamples + 1 : 0;
+            if (session.levelSamples < 25)
+            {
+                return MICRODUCK_ESTIMATE_OK;
+            }
+            session.needsLevel = false;
+            session.frames.clear();
+        }
         session.frames.push_back({aligned});
         while (session.frames.size() > 350 ||
                session.lastNs - session.frames.front().aligned.imuSampleNs > kMotionWindowNs)
@@ -496,7 +557,7 @@ int microduck_head_calibration_capture(void* handle,
         return MICRODUCK_ESTIMATE_INVALID;
     }
     *status = {};
-    status->abiVersion = 1;
+    status->abiVersion = 2;
     Session& session = *static_cast<Session*>(handle);
     int result = MICRODUCK_ESTIMATE_OK;
     try
@@ -528,7 +589,7 @@ int microduck_head_calibration_capture(void* handle,
         result = MICRODUCK_ESTIMATE_INVALID;
     }
     status->nextStep = session.nextStep;
-    status->mountAvailable = session.nextStep >= 3 ? 1 : 0;
+    status->mountAvailable = session.nextStep >= 4 ? 1 : 0;
     std::copy(session.mount.begin(), session.mount.end(), status->mountWxyz);
     return result;
 }

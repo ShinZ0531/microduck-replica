@@ -1,49 +1,75 @@
 import { html, useEffect, useRef, useState } from './vendor/preact-htm.module.js';
 
 export const HEAD_CALIBRATION_STEPS = [
-    ['摆正，采初始姿态', '托住整只鸭子，使躯干水平；承托头颈并保持不变，停稳至少 2 秒。'],
-    ['机身前倾，求安装方向', '头颈相对机身保持上一步姿态；让整个机身前倾 15–30°，停稳至少 2 秒。不是只低头。'],
-    ['机身左倾，求安装方向', '头颈仍保持初始姿态；让整个机身向鸭子自己的左侧倾斜 15–30°，停稳至少 2 秒。'],
-    ['摆正，建立独立复核基准', '将整个机身重新摆正、固定好躯干；头部保持不动，停稳至少 2 秒。'],
-    ['固定躯干，核对 ID30 颈俯仰', '固定躯干，只手动缓慢转动 ID30，往返行程至少 8°；其他头颈关节保持不变。连续操作约 3 秒后立即采集。'],
-    ['固定躯干，核对 ID31 头俯仰', '固定躯干，只手动缓慢转动 ID31，往返行程至少 8°；其他头颈关节保持不变，操作后立即采集。'],
-    ['固定躯干，核对 ID32 头偏航', '固定躯干，只手动缓慢转动 ID32，往返行程至少 8°；其他头颈关节保持不变，操作后立即采集。'],
-    ['固定躯干，核对 ID33 头横滚', '固定躯干，只手动缓慢转动 ID33，往返行程至少 8°；保持在机械允许范围内，其他关节不动，操作后立即采集。'],
-    ['机身前倾，复核补偿方向', '固定头颈相对机身，整个机身前倾 15–30°，停稳至少 2 秒；确认主程序读到的是身体向前倾斜。'],
-    ['机身左倾，复核补偿方向', '固定头颈相对机身，整个机身向鸭子自己的左侧倾斜 15–30°，停稳至少 2 秒。'],
+    ['站姿静止', '鸭子通电站在平桌上，保持已有站姿，静止约 3 秒。不是躺在桌上。'],
+    ['整机前倾', '双手握躯干稍微提起，先端平，再让头那一侧向下倾约 15–20°，停稳约 2 秒；头颈由舵机保持。'],
+    ['整机后倾', '先将整只鸭子回到站姿端平、停半秒，再向后倾约 15–20°，停稳约 2 秒。'],
+    ['整机左倾', '先回到站姿端平、停半秒，再向鸭子自己的左侧倾约 15–20°，停稳约 2 秒。'],
+    ['整机右倾', '先回到站姿端平、停半秒，再向鸭子自己的右侧倾约 15–20°，停稳约 2 秒。'],
+    ['桌面站姿基准', '放回桌面，保持通电站立；机身站稳后自动采集，不需要扶头或掰关节。'],
+    ['ID30 颈俯仰', '程序自动缓慢测试颈俯仰约 ±5°，其余关节继续保持站姿。'],
+    ['ID31 头俯仰', '程序自动缓慢测试头俯仰约 ±5°，其余关节继续保持站姿。'],
+    ['ID32 头偏航', '程序自动缓慢测试左右转头约 ±5°，同时检查运动过程的角速度补偿。'],
+    ['ID33 头横滚', '程序自动缓慢测试头横滚约 ±5°，其余关节继续保持站姿。'],
 ];
 
-/** 独立头部向导只发送步骤操作；测量、误差判定和保存都由主程序完成。 */
+/** 将原生阶段映射为明确的用户操作；自动采集期间不提供逐步采集按钮。 */
+function mainAction(state) {
+    if (!state?.active) {
+        return { operation: 'start', label: '开始整机站姿采集' };
+    }
+    if (state.ready_to_save) {
+        return { operation: 'save', label: '保存安装与补偿核验结果' };
+    }
+    if (state.next_step >= 5) {
+        return { operation: 'test', label: '开始 / 重试自动头部测试（±5°）' };
+    }
+    return { operation: 'resume', label: '继续整机站姿采集' };
+}
+
+/** 通电站姿两阶段向导；原生主控采样和调度，查询只续租，不自动恢复暂停的轨迹。 */
 export function HeadCalibrationPanel({ imu, link, live }) {
     const [state, setState] = useState(null);
     const [message, setMessage] = useState('');
     const [confirmation, setConfirmation] = useState(null);
-    const stepKey = `${imu?.mode}/${state?.active === true ? state.next_step : 'start'}`;
-    const confirmed = confirmation === stepKey;
     const [busy, setBusy] = useState(false);
     const [fetching, setFetching] = useState(false);
     const pending = useRef(false);
+    const commanding = useRef(false);
+    const revision = useRef(0);
     const alive = useRef(true);
-    const statusError = useRef(false);
+    const phase = state?.next_step >= 5 ? 'head-test' : 'body-capture';
+    const action = mainAction(state);
+    const confirmKey = `${imu?.mode}/${phase}/${action.operation}`;
+    const confirmed = confirmation === confirmKey;
+    const holding = imu?.mode === 'commissioning' && imu?.hold?.stage === 'holding';
+    const active = state?.active === true;
+    const running = state?.running === true;
+    const step = state?.next_step ?? 0;
+    const saved = !!imu?.head_verification || state?.saved === true;
+
     useEffect(() => {
         alive.current = true;
         let timer;
         let stopped = false;
-        /** 前台有界查询主控会话；不会因为轮询而采集、保存或改变运动模式。 */
+        /** 前台每秒查询会话；离页停止续租，由主控在 2.5 秒内停止轨迹并保留站姿。 */
         async function poll() {
-            if (!document.hidden && !pending.current && live) {
+            if (!document.hidden && !pending.current && !commanding.current && live) {
                 pending.current = true;
                 setFetching(true);
+                const requestRevision = revision.current;
                 try {
                     const reply = await link.cmd('imu.op', { op: 'head-status' }, 10000);
-                    if (!stopped) {
+                    if (!stopped && requestRevision === revision.current) {
                         if (reply.ok) {
                             setState(reply.data);
-                            statusError.current = false;
-                        } else if (!statusError.current) {
-                            setMessage(reply.reason || reply.error || '无法读取头部核验状态');
-                            statusError.current = true;
+                        } else {
+                            setMessage(reply.reason || reply.error || '无法读取站姿核验状态');
                         }
+                    }
+                } catch {
+                    if (!stopped) {
+                        setMessage('连接中断；主控将停止测试轨迹，恢复连接后需明确重试。');
                     }
                 } finally {
                     pending.current = false;
@@ -63,73 +89,72 @@ export function HeadCalibrationPanel({ imu, link, live }) {
             clearTimeout(timer);
         };
     }, [link, live]);
-    /** 用户明确确认后提交当前步骤；失败保留原步骤及具体拒绝原因。 */
+
+    /** 明确启动某阶段或停止；失败保留原生进度，不在页面推测成功。 */
     async function run(operation) {
-        if (pending.current || busy || !live || (!confirmed && operation !== 'cancel')) {
+        const stopping = operation === 'pause' || operation === 'cancel';
+        if (commanding.current || !live || (!stopping && (pending.current || !confirmed))) {
             return;
         }
-        pending.current = true;
+        commanding.current = true;
+        revision.current += 1;
         setBusy(true);
         setMessage('');
         try {
-            const reply = await link.cmd('imu.op', {
-                op: `head-${operation}`, step: state?.next_step ?? 0, confirmed: true,
-            }, 10000);
+            const reply = await link.cmd('imu.op', { op: `head-${operation}`, confirmed: true }, 10000);
             if (!alive.current) {
                 return;
             }
             if (reply.ok) {
                 setState(reply.data);
                 setConfirmation(null);
-                setMessage(reply.data?.saved
-                    ? '主程序已保存头部安装核验。请回总览“上手清单”，先预览，再写进主程序。'
-                    : operation === 'cancel' ? '会话已取消，本次未保存安装方向。' : '这一步通过，请按下一步提示继续。');
+                if (reply.data?.saved) {
+                    setMessage('已保存头部安装核验。当前仍通电保持站姿；扶稳后卸力，再回上手清单预览并写进主程序。');
+                }
             } else {
-                setMessage(reply.reason || reply.error || '未通过；请按原因调整后重试，本次未保存。');
+                setMessage(reply.reason || reply.error || '操作未完成，请检查主控返回的原因。');
+            }
+        } catch {
+            if (alive.current) {
+                setMessage('未收到主控确认，请恢复连接查看实际状态；不会自动重试动作。');
             }
         } finally {
-            pending.current = false;
+            commanding.current = false;
             if (alive.current) {
                 setBusy(false);
             }
         }
     }
-    const active = state?.active === true;
-    const step = state?.next_step ?? 0;
-    const ready = active && state?.ready_to_save === true;
-    const saved = !!imu?.head_verification || state?.saved === true;
-    const current = HEAD_CALIBRATION_STEPS[step];
-    const canStart = live && imu?.mode === 'commissioning';
-    const reports = state?.reports || [];
+
+    let confirmText = '鸭子已通电保持站姿，我将双手握躯干按提示倾斜整机；不需要扶头';
+    if (action.operation === 'test') {
+        confirmText = '鸭子已放回桌面并站稳，我已确认头颈约 ±5° 内没有干涉，同意程序自动测试四个关节';
+    } else if (action.operation === 'save') {
+        confirmText = '我确认保存这次真实采集和自动测试的核验结果';
+    }
     return html`<section class="board imu-card head-calibration" aria-labelledby="head-calibration-title">
-        <h3 id="head-calibration-title">头部 BMI088 专用安装核验</h3>
-        <p>此传感器随头部运动。需要同时校验安装方向和实际关节补偿，不能使用固定躯干 IMU 的粗校流程。</p>
-        <p class="sv-small">全程承托躯干和头部、保持舵机断力，手动操作。不会自动转动关节；不要让头部自由垂落或碰到机械限位。
-            本次保存只更新头部 IMU 核验，保留已完成的舵机零位。</p>
-        ${saved && !active ? html`<p role="status">已读到主控保存的头部核验结果。可回上手清单继续“写进主程序”。</p>` : null}
-        ${active ? html`<p class="num">进度 ${Math.min(step, 10)} / 10 · 当前窗口 ${state.sample_count ?? 0} 帧</p>
-            ${current ? html`<h4>${step + 1}. ${current[0]}</h4><p>${current[1]}</p>`
-                : html`<p>十步实测已齐全。保持连接和断力，确认保存本次安装核验。</p>`}
+        <h3 id="head-calibration-title">头部 BMI088 · 通电站姿核验</h3>
+        <p>先用上方“站姿使能”。第一段保持站姿、双手握躯干提起并倾斜整机；第二段放回桌面站立，由程序自动测试头颈。</p>
+        <p class="sv-small">全程保留原有机械零位。头颈由舵机保持，不需要手扶头部或手动掰通电关节。
+            “停止测试”保留通电站姿；上方“失能 / 卸力”会让整只鸭子软下来。</p>
+        ${saved && !active ? html`<p role="status">已读到主控保存的头部核验结果。扶稳并卸力后，可回上手清单继续。</p>` : null}
+        ${active ? html`<p class="num">进度 ${Math.min(step, 10)} / 10</p>
+            ${HEAD_CALIBRATION_STEPS[step] ? html`<h4>${HEAD_CALIBRATION_STEPS[step][0]}</h4>
+                <p>${HEAD_CALIBRATION_STEPS[step][1]}</p>` : null}
+            ${state.countdown_s > 0 && running ? html`<p role="status">准备时间：${state.countdown_s} 秒</p>` : null}
+            <p role="status">${state.message}</p>
             <ol>${HEAD_CALIBRATION_STEPS.map(([title], index) => html`<li key=${index}
-                aria-current=${index === step ? 'step' : null}>${index < step ? '✓ ' : ''}${title}</li>`)}</ol>`
-            : html`<p>准备好后开始：摆正、整机前倾、整机左倾求安装；再逐个转动四个头颈关节，并复核整机倾斜。</p>`}
-        <label><input type="checkbox" checked=${confirmed} disabled=${busy}
-            onChange=${(event) => setConfirmation(event.currentTarget.checked ? stepKey : null)} />
-            ${active && step >= 4 && step <= 7 ? '我已固定躯干，只缓慢转动当前指定关节'
-                : ready ? '我确认保存本次真实采样结果，鸭子仍已承托且断力'
-                    : '我已按当前提示承托并固定机身或头部，舵机已断力'}</label>
+                aria-current=${index === step ? 'step' : null}>${index < step ? '✓ ' : ''}${title}</li>`)}</ol>` : null}
+        ${!running ? html`<label><input type="checkbox" checked=${confirmed} disabled=${busy}
+            onChange=${(event) => setConfirmation(event.currentTarget.checked ? confirmKey : null)} />${confirmText}</label>` : null}
         <div class="imu-actions">
-            <button class="btn-dark" disabled=${busy || fetching || !confirmed || !canStart}
-                onClick=${() => run(active ? ready ? 'save' : 'capture' : 'start')}>
-                ${busy ? '正在核验…' : active ? ready ? '保存头部核验结果' : '采集并核对这一步' : '开始头部专用核验'}</button>
-            ${active ? html`<button disabled=${busy || fetching || !live} onClick=${() => run('cancel')}>取消本次核验</button>` : null}
+            ${!running ? html`<button class="btn-dark" disabled=${busy || fetching || !confirmed || !live || !holding}
+                onClick=${() => run(action.operation)}>${busy ? '等待主控确认…' : action.label}</button>` : null}
+            ${active && running ? html`<button class="btn-dark" disabled=${busy || !live}
+                onClick=${() => run('pause')}>停止采集 / 测试，保留站姿</button>` : null}
+            ${active ? html`<button disabled=${busy || !live} onClick=${() => run('cancel')}>取消本次核验，保留站姿</button>` : null}
         </div>
-        ${!canStart ? html`<p class="sv-warn">需要主程序在线并处于标定模式。当前不可开始新的头部安装核验。</p>` : null}
-        ${reports.length > 0 ? html`<details><summary>已通过步骤的实测结果</summary><ul>
-            ${reports.map((report) => html`<li key=${report.step}>步骤 ${report.step + 1}：${report.sample_count} 帧
-                ${report.step >= 4 && report.step <= 7
-                    ? `，躯干姿态残差 ${report.max_body_error_deg.toFixed(2)}°，角速度残差 ${report.body_gyro_rms_rad_s.toFixed(3)} rad/s`
-                    : ''}</li>`)}</ul></details>` : null}
+        ${!holding ? html`<p class="sv-warn">需要主控在线、处于标定模式并完成站姿保持。先点上方“站姿使能”。</p>` : null}
         ${message ? html`<p class="sv-warn" role="status">${message}</p>` : null}
     </section>`;
 }

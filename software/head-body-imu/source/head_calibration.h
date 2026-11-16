@@ -7,7 +7,7 @@ extern "C"
 {
 #endif
 
-    /* 校准会话 ABI 独立于估计 ABI v1；错误文本 UTF-8，角度 deg、角速度 rad/s。 */
+    /* 校准会话 ABI v2 独立于估计 ABI v1；错误文本 UTF-8，角度 deg、角速度 rad/s。 */
     struct MicroduckHeadCalibrationStatus
     {
         unsigned int abiVersion;
@@ -20,6 +20,7 @@ extern "C"
         double bodyGyroRmsRadS;
         double bodyGyroPeakRadS;
         double headSpanDeg;
+        double gyroRelativeErrorRatio;
         char reason[256];
     };
 
@@ -35,8 +36,9 @@ extern "C"
                                            const struct MicroduckEncoderPair* encoders);
 
     /** 获取状态，或验证当前步骤（capture=1）；失败保留步骤，可修正姿态后重试。
- * 步骤 0/1/2：摆正/机身前倾/机身左倾求安装；3：摆正验证基准；4–7：固定躯干逐个转动 ID30–33；
- * 8/9：机身前倾/左倾复核；10 表示核验齐全。成功不写文件、不授权电机。
+ * 步骤 0–4：站姿摆正/前倾/后倾/左倾/右倾；前后配对及右倾作为复核；
+ * 5：桌面站姿基准；6–9：身体站姿保持、逐个自动测试 ID30–33；10 表示核验齐全。
+ * 成功不写文件、不授权电机；实际运动由原生控制器独占调度。
  */
     int microduck_head_calibration_capture(void* session,
                                            unsigned int step,

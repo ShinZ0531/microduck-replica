@@ -788,7 +788,7 @@ class ImuBackend:
 
     async def _head_op(self, args, by=None):
         """转交头部专用步骤，不接收页面测量或安装四元数；保存后独立读回原生证据。"""
-        operations = {"head-start": "start", "head-status": "status", "head-capture": "capture",
+        operations = {"head-start": "start", "head-status": "status", "head-resume": "resume", "head-test": "test", "head-pause": "pause",
                       "head-save": "save", "head-cancel": "cancel"}
         operation = operations.get(args.get("op"))
         if operation is None or set(args) - {"op", "step", "confirmed"}:
@@ -797,7 +797,7 @@ class ImuBackend:
         if type(step) is not int or not 0 <= step <= 10:
             raise Refused("头部核验步骤无效")
         if operation != "status" and args.get("confirmed") is not True:
-            raise Refused("请先按当前步骤扶稳机身或头部并明确确认")
+            raise Refused("请先确认当前站姿采集或自动头部测试的操作条件")
         bus = await self._bus_once()
         source, _ = mount_of(bus, fresh_calib(self.rd))
         if source != "head_bmi088":
@@ -824,7 +824,7 @@ class ImuBackend:
                     require_head_proof(status["calibration"], status.get("head_imu_verification"), mount)
                 except (CalibError, KeyError) as error:
                     raise Refused("主程序保存后的头部核验报告未准确读回：" + str(error)) from error
-                self.log.info("头部 IMU 十步安装核验已保存；零位及运动许可未改变", cat="IMU",
+                self.log.info("头部 IMU 站姿核验已保存；零位及策略运动许可未改变", cat="IMU",
                               ctx={"by": by, "source": source})
             return result
 
@@ -832,12 +832,12 @@ class ImuBackend:
         """分派现有固定躯干流程和独立头部流程；禁止两类校准语义混用。"""
         op = args.get("op")
         if isinstance(op, str) and op.startswith("head-"):
-            if self._verify_lock.locked():
+            if self._verify_lock.locked() and op not in ("head-pause", "head-cancel"):
                 raise Refused("当前头部校验请求尚未结束，请稍候")
             return await self._head_op(args, by)
         if self.view().get("source") == "head_bmi088" and op in (
-                "solve", "coarse-capture", "verify", "hold", "redo-start", "profile-select"):
-            raise Refused("头部 BMI088 请使用专用核验卡片，不能使用固定躯干粗校或站姿使能")
+                "solve", "coarse-capture", "verify", "redo-start", "profile-select"):
+            raise Refused("头部 BMI088 请使用专用核验卡片，不能使用固定躯干求解；站姿使能可正常使用")
         if self._verify_lock.locked():
             raise Refused("安装方向正在验证：等当前操作结束，紧急时仍可卸力")
         if (op in ("coarse-capture", "solve", "verify", "redo-start", "profile-select")

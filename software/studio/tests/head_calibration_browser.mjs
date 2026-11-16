@@ -17,25 +17,27 @@ import {html,render} from '/vendor/preact-htm.module.js';
 import {HeadCalibrationPanel} from '/head-calibration.js';
 window.calls=[];window.phase={active:false};window.failNext=false;
 window.fakeLink={
-/** 模拟主控有序推进及一次失败；仅记录操作，不连接实物或生成真实核验证明。 */
+/** 模拟原生自动采集和失败暂停；不连接实物，不生成真实核验证据。 */
 async cmd(name,args){
-    window.calls.push({name,args});
-    if(args.op==='head-start')window.phase={active:true,next_step:0,reports:[],sample_count:100};
-    if(args.op==='head-capture'){
-        if(window.failNext){window.failNext=false;return {ok:false,reason:'模拟：躯干补偿误差过大，未保存'};}
-        if(args.step!==window.phase.next_step)return {ok:false,reason:'模拟：不允许跳步'};
-        window.phase.reports.push({step:args.step,sample_count:100,max_body_error_deg:.2,body_gyro_rms_rad_s:.01});
-        window.phase.next_step++;window.phase.ready_to_save=window.phase.next_step===10;
-    }
-    if(args.op==='head-save'){
-        if(window.phase.next_step!==10)return {ok:false,reason:'模拟：尚未完成'};
-        window.phase={active:false,saved:true};
-    }
-    if(args.op==='head-cancel')window.phase={active:false,cancelled:true};
-    return {ok:true,data:structuredClone(window.phase)};
+ window.calls.push({name,args});
+ if(args.op==='head-start')window.phase={active:true,running:true,next_step:0,reports:[]};
+ if(args.op==='head-pause')window.phase.running=false;
+ if(args.op==='head-resume'||args.op==='head-test')window.phase.running=true;
+ if(args.op==='head-status'&&window.phase.active&&window.phase.running){
+  if(window.failNext&&window.phase.next_step===7){window.failNext=false;window.phase.running=false;window.phase.message='模拟：补偿误差过大，自动测试已停止';}
+  else{window.phase.reports.push({step:window.phase.next_step,sample_count:100});window.phase.next_step++;
+   if(window.phase.next_step===5||window.phase.next_step===10)window.phase.running=false;
+   window.phase.ready_to_save=window.phase.next_step===10;}
+ }
+ if(args.op==='head-save'){
+  if(window.phase.next_step!==10)return {ok:false,reason:'模拟：尚未完成'};
+  window.phase={active:false,saved:true};
+ }
+ if(args.op==='head-cancel')window.phase={active:false,cancelled:true};
+ return {ok:true,data:structuredClone(window.phase)};
 }};
 window.unmount=()=>render(null,document.querySelector('#root'));
-render(html\`<\${HeadCalibrationPanel} imu=\${{source:'head_bmi088',mode:'commissioning'}}
+render(html\`<\${HeadCalibrationPanel} imu=\${{source:'head_bmi088',mode:'commissioning',hold:{stage:'holding'}}}
     link=\${window.fakeLink} live=\${true} />\`,document.querySelector('#root'));
 </script>`;
 
@@ -136,36 +138,39 @@ try {
     await waitFor(`!!document.querySelector('button.btn-dark')`);
     assert.equal(await evaluate(`document.querySelector('button.btn-dark').disabled`), true);
     await clickMain();
-    await waitFor(`window.phase.active===true && document.querySelector('h4')?.textContent.includes('摆正')`);
-    for (let step = 0; step < 10; step++) {
-        if (step === 4) {
-            await screenshot('head-calibration-desktop.png');
-            await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
-            await screenshot('head-calibration-mobile.png');
-            assert(await evaluate(`document.documentElement.scrollWidth<=innerWidth+1`));
-            await evaluate('window.failNext=true');
-            await clickMain();
-            await waitFor(`document.querySelector('section').textContent.includes('补偿误差过大')`);
-            assert.equal(await evaluate('window.phase.next_step'), 4);
-            assert.equal(await evaluate(`window.calls.filter(c=>c.args.op==='head-save').length`), 0);
-        }
-        await clickMain();
-        await waitFor(`window.phase.next_step===${step + 1} && document.querySelector('p.num')?.textContent.includes('${step + 1} / 10')`);
-    }
-    assert.equal(await evaluate(`window.calls.filter(c=>c.args.op==='head-save').length`), 0);
+    await waitFor(`window.phase.next_step>=1`);
+    await evaluate(`document.querySelector('button.btn-dark').click()`);
+    await waitFor(`window.phase.running===false && !!document.querySelector('input')`);
+    const pausedStep=await evaluate('window.phase.next_step');
+    await new Promise((resolveWait)=>setTimeout(resolveWait,1300));
+    assert.equal(await evaluate('window.phase.next_step'),pausedStep,'status cannot resume paused work');
+    await screenshot('head-calibration-desktop.png');
+    await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+    await screenshot('head-calibration-mobile.png');
+    assert(await evaluate(`document.documentElement.scrollWidth<=innerWidth+1`));
+    await clickMain();
+    await waitFor(`window.phase.next_step===5 && !!document.querySelector('input')`,10000);
+    assert.equal(await evaluate(`window.calls.filter(c=>c.args.op==='head-test').length`),0,'head motion requires separate consent');
+    await evaluate('window.failNext=true');
+    await clickMain();
+    await waitFor(`window.phase.next_step===7 && window.phase.running===false && document.querySelector('section').textContent.includes('补偿误差过大')`,10000);
+    assert.equal(await evaluate(`window.calls.filter(c=>c.args.op==='head-save').length`),0);
+    await clickMain();
+    await waitFor(`window.phase.next_step===10 && !!document.querySelector('input')`,10000);
+    assert.equal(await evaluate(`window.calls.filter(c=>c.args.op==='head-save').length`),0,'automatic completion never saves');
     await clickMain();
     await waitFor(`document.querySelector('section').textContent.includes('已保存头部安装核验')`);
-    const calls = await evaluate('window.calls');
-    assert.equal(calls.filter((call) => call.args.op === 'head-save').length, 1);
-    assert(calls.every((call) => call.name === 'imu.op' && Object.keys(call.args).every(
-        (key) => ['op', 'step', 'confirmed'].includes(key))));
+    const calls=await evaluate('window.calls');
+    assert.equal(calls.filter((call)=>call.args.op==='head-save').length,1);
+    assert.equal(calls.filter((call)=>call.args.op==='head-capture').length,0,'no per-pose clicks');
+    assert(calls.every((call)=>call.name==='imu.op'&&Object.keys(call.args).every((key)=>['op','confirmed'].includes(key))));
     await evaluate('window.unmount()');
     const before = await evaluate('window.calls.length');
     await new Promise((resolveWait) => setTimeout(resolveWait, 1200));
     assert.equal(await evaluate('window.calls.length'), before, 'unmount must stop polling');
     assert.deepEqual(errors, []);
-    process.stdout.write(JSON.stringify({ passed: true, captures: 11, explicitSaves: 1,
-        failureDidNotAdvance: true, stoppedPolling: true, browserErrors: errors }) + '\n');
+    process.stdout.write(JSON.stringify({ passed: true, automaticCaptures: 10, explicitSaves: 1,
+        pauseDidNotResume: true, separateHeadConsent: true, failureDidNotAdvance: true, stoppedPolling: true, browserErrors: errors }) + '\n');
 } finally {
     await send('Page.close').catch(() => {});
     socket.close();

@@ -3,4 +3,4 @@
 [trunk_imu]
 source = "head_bmi088"
 head_socket = "/run/tofd/tof.sock"
-head_estimator_library = "/opt/microduck/local-components/head-body-v3/libmicroduck_head_body.so"
+head_estimator_library = "/opt/microduck/local-components/head-body-v4/libmicroduck_head_body.so"

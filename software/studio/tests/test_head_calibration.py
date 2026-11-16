@@ -19,13 +19,13 @@ def head_fixture():
     quat = [0.5, 0.5, 0.5, 0.5]
     calibration["imu_mounts"]["head_bmi088"] = {"quat": quat, "verified": True}
     proof = {
-        "contract": "head_mount_fixed_torso_v1", "source": "head_bmi088", "mount": quat,
+        "contract": "head_mount_standing_v2", "source": "head_bmi088", "mount": quat,
         "binding": {"model_sha256": "078693dff3bcd5e69eb6cc483974178e1511a11f762b1a4dd00370bc5d58b8a8",
                     "joints": [{key: row.get(key) for key in ("id", "name", "zero_raw", "direction")}
                                for row in calibration["joints"] if row["id"] in (30, 31, 32, 33)]},
         "reports": [{"step": step, "sample_count": 100, "sample_span_s": 1.98,
                      "max_body_error_deg": 0.5, "body_gyro_rms_rad_s": 0.02, "body_gyro_peak_rad_s": 0.05,
-                     "head_span_deg": 12.0 if 4 <= step <= 7 else 0.0} for step in range(10)],
+                     "gyro_relative_error_ratio": 0.1, "head_span_deg": 12.0 if 6 <= step <= 9 else 0.0} for step in range(10)],
     }
     return calibration, proof
 
@@ -37,16 +37,18 @@ class HeadProofTest(unittest.TestCase):
         """报告缺步、关节几何改变及超差残差均被拒绝。"""
         calibration, proof = head_fixture()
         C.require_head_proof(calibration, proof, proof["mount"])
-        for change in ("missing", "zero", "gyro", "error", "span"):
+        for change in ("missing", "zero", "gyro", "error", "span", "ratio", "old_contract"):
             changed, record = copy.deepcopy(calibration), copy.deepcopy(proof)
             if change == "missing":
                 record["reports"].pop()
+            elif change == "old_contract":
+                record["contract"] = "head_mount_fixed_torso_v1"
             elif change == "zero":
                 changed["joints"][6]["zero_raw"] += 1
             else:
                 key, value = {"gyro": ("body_gyro_rms_rad_s", 0.3), "error": ("max_body_error_deg", 8.0),
-                              "span": ("head_span_deg", 1.0)}[change]
-                record["reports"][4][key] = value
+                              "span": ("head_span_deg", 1.0), "ratio": ("gyro_relative_error_ratio", 1.0)}[change]
+                record["reports"][6][key] = value
             with self.subTest(change=change), self.assertRaises(C.CalibError):
                 C.require_head_proof(changed, record, proof["mount"])
 
@@ -95,16 +97,26 @@ class HeadBackendTest(unittest.IsolatedAsyncioTestCase):
             backend = ImuBackend(rd, Log(), directory)
             backend._bus_once = mock.AsyncMock(return_value=rd.bus.value)
             backend._rpc_once = mock.AsyncMock(return_value={"active": True, "next_step": 1})
-            result = await backend.handle({"op": "head-capture", "step": 0, "confirmed": True})
+            result = await backend.handle({"op": "head-test", "step": 0, "confirmed": True})
             self.assertEqual(result["next_step"], 1)
             self.assertEqual(backend._rpc_once.call_args.args[1], {
-                "action": "head-imu-calibration", "operation": "capture", "step": 0, "confirmed": True})
-            for args in ({"op": "head-capture", "step": 0, "confirmed": True, "samples": []},
+                "action": "head-imu-calibration", "operation": "test", "step": 0, "confirmed": True})
+            for args in ({"op": "head-test", "step": 0, "confirmed": True, "samples": []},
                          {"op": "head-save", "confirmed": True, "mount": proof["mount"]},
-                         {"op": "head-capture", "step": True, "confirmed": True},
+                         {"op": "head-test", "step": True, "confirmed": True},
                          {"op": "verify", "confirmed": True}):
                 with self.subTest(args=args), self.assertRaises(Refused):
                     await backend.handle(args)
+
+    async def test_head_source_keeps_the_original_standing_enable_entry(self):
+        """头部来源复用原站姿使能入口，不再被专用流程的来源检查误拦。"""
+        calibration, _ = head_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            rd = Rd({"calibration": calibration, "imu_source": "head_bmi088"}, source="head_bmi088")
+            backend = ImuBackend(rd, Log(), directory)
+            backend._hold = mock.AsyncMock(return_value={"holding": True})
+            self.assertEqual(await backend.handle({"op": "hold"}), {"holding": True})
+            backend._hold.assert_awaited_once()
 
 
 class HeadCommitTest(HelperBase):

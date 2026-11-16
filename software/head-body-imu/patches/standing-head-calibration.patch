@@ -1,0 +1,754 @@
+diff --git a/microduck-hd1910/firmware/docs/design/robotd-design.md b/microduck-hd1910/firmware/docs/design/robotd-design.md
+index 805607b..c9d8e8b 100644
+--- a/microduck-hd1910/firmware/docs/design/robotd-design.md
++++ b/microduck-hd1910/firmware/docs/design/robotd-design.md
+@@ -1626,3 +1626,27 @@ Feetech 上力时从已验证模型合同的 `actuators[0].kp_fw` 取得 P，使
+ HOME 与联合 Walk 保持都使用同一 HD1910 合同 P，当前为 5；`Safety::apply` 的状态 gain 经 `FeetechIo::set_gain` 不产生寄存器写入，不能用 XL330 gain 或 `standing_gain_ratio` 推断本机承重。当前 Stand 槽为 none，联合模型零速度保持仍走 Walk。v154 起的 P-only 上力与恢复规则继续沿用，本版未提高 P，未改写 48／51；它们是设备当前值，源码不能将其声称为固定 0 或 20。HOME 固定目标由舵机内部位置闭环跟随，模型保持持续根据观测调整目标；同 P 不表示物理表现相同。
+ 
+ 实际进入保持继续要求关节 HOME 误差不超过 5°、倾斜不超过 10°、连续三个有效周期及原反馈新鲜度。`homed` 只表示回位阶段完成，不等于载荷下实测完全到位。此状态修正不能据此认定“不够硬”、回位残差或实机倾斜／摔倒的全部原因；它也未增加正常 50 Hz 控制工作。页面连接等待及保存方向分别见 [连接设计](r17-connection-design.md#initial-feedback-and-reconnection-v10155) 和 [设置设计](r17-settings-design.md#v10155-已保存方向显示)。
++
++
++### Local standing-head calibration (control.48-head-bmi088.4, API 45)
++
++The `head_bmi088` commissioning extension uses contract `head_mount_standing_v2` and
++calibration C ABI v2 (352-byte status); the estimator ABI v1 is unchanged. A settled
++`hold-home` keeps all joints powered. Only the commissioning Hold writes UART targets;
++`head_imu_standing.rs` schedules automatic static captures and bounded head trajectories.
++
++`head-imu-calibration` accepts `start`, `status`, `resume`, `test`, `pause`, `cancel`, and
++`save`. Start only collects the standing/forward/back/left/right sequence. Test requires
++separate operator confirmation after the robot is placed back on the table, still
++standing; it captures a fresh standing baseline then tests ID30–33 in sequence at about
++±5 degrees. Source data and encoder feedback come from the real providers, not clients.
++Status renews a 2.5-second foreground lease but never resumes paused work. Timeout,
++missing data or follow error pauses the trajectory; normal stop freezes the active head
++joint at measured position and retains body Hold. Relax/power requests still cut torque
++through the original path. A paused or active run blocks unrelated calibration writes.
++
++The native report is bound to model, head zero/direction, mount and all ten measurements;
++head-motion checks also require low smoothed residual gyro energy relative to expected
++head motion, so a zero gyro cannot pass simply because the sweep is slow. Save is explicit
++and keeps policy motion disabled. To commit and restart into policy mode, the operator
++must support the robot and relax first. Fixed-body `verify-imu` still refuses this source.
+diff --git a/microduck-hd1910/firmware/duck-control/src/head_calibration.rs b/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
+index aa49d09..82ce969 100644
+--- a/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
++++ b/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
+@@ -8,7 +8,7 @@ use crate::head_compensation::{EncoderPair, HeadCompensation, HeadInput};
+ use crate::trunk_imu::{HostImuSample, TrunkImuKind};
+ use serde_json::{Value, json};
+ 
+-pub const CONTRACT: &str = "head_mount_fixed_torso_v1";
++pub const CONTRACT: &str = "head_mount_standing_v2";
+ 
+ /// 与独立校准 ABI 一致；现有估计 ABI v1 不改布局。
+ #[repr(C)]
+@@ -23,6 +23,7 @@ struct Status {
+     gyro_rms: f64,
+     gyro_peak: f64,
+     head_span: f64,
++    gyro_ratio: f64,
+     reason: [c_char; 256],
+ }
+ 
+@@ -164,12 +165,12 @@ impl Session {
+         // SAFETY: Status 只含 C POD，零填充同时保证错误文本有终止符。
+         let mut status: Status = unsafe { std::mem::zeroed() };
+         let result = unsafe { (self.capture)(self.handle, step, u32::from(capture), &mut status) };
+-        if status.version != 1 || status.step > 10 {
++        if status.version != 2 || status.step > 10 {
+             return Err("头部校准 ABI 返回无效状态".into());
+         }
+         let row = json!({"step":step,"sample_count":status.count,"sample_span_s":status.span,
+             "max_body_error_deg":status.error_deg,"body_gyro_rms_rad_s":status.gyro_rms,
+-            "body_gyro_peak_rad_s":status.gyro_peak,"head_span_deg":status.head_span});
++            "body_gyro_peak_rad_s":status.gyro_peak,"head_span_deg":status.head_span,"gyro_relative_error_ratio":status.gyro_ratio});
+         if result != 0 {
+             let bytes: Vec<_> = status
+                 .reason
+@@ -225,11 +226,12 @@ fn valid_report(index: usize, report: &Value) -> bool {
+             .and_then(Value::as_u64)
+             .is_some_and(|count| count >= 60)
+         && number("sample_span_s").is_some_and(|span| span >= 1.5);
+-    if (4..=7).contains(&index) {
++    if (6..=9).contains(&index) {
+         basic
+             && number("max_body_error_deg").is_some_and(|value| (0.0..=5.0).contains(&value))
+             && number("body_gyro_rms_rad_s").is_some_and(|value| (0.0..=0.15).contains(&value))
+             && number("body_gyro_peak_rad_s").is_some_and(|value| (0.0..=0.5).contains(&value))
++            && number("gyro_relative_error_ratio").is_some_and(|value| (0.0..=0.5).contains(&value))
+             && number("head_span_deg").is_some_and(|value| (8.0..=360.0).contains(&value))
+     } else {
+         basic
+@@ -298,7 +300,7 @@ mod tests {
+             .map(|step| {
+                 json!({"step":step,"sample_count":100,
+             "sample_span_s":1.98,"max_body_error_deg":0.1,"body_gyro_rms_rad_s":0.01,"body_gyro_peak_rad_s":0.02,
+-            "head_span_deg":10.0})
++            "head_span_deg":10.0,"gyro_relative_error_ratio":0.1})
+             })
+             .collect();
+         let proof = json!({"contract":CONTRACT,"source":"head_bmi088",
+@@ -350,6 +352,6 @@ mod tests {
+         assert_eq!(status["ready_to_save"], false);
+         assert_eq!(status["mount"], Value::Null);
+         assert_eq!(status["reports"], json!([]));
+-        assert_eq!(std::mem::size_of::<Status>(), 344);
++        assert_eq!(std::mem::size_of::<Status>(), 352);
+     }
+ }
+diff --git a/microduck-hd1910/firmware/duck-ipc-proto/src/lib.rs b/microduck-hd1910/firmware/duck-ipc-proto/src/lib.rs
+index c94a64e..6e5ac07 100644
+--- a/microduck-hd1910/firmware/duck-ipc-proto/src/lib.rs
++++ b/microduck-hd1910/firmware/duck-ipc-proto/src/lib.rs
+@@ -450,8 +450,8 @@ pub const JSONRPC_VERSION: &str = "2.0";
+ /// Install the matching robotd/Studio pair: calibration-status advertises
+ /// imu_verification_contract and successful verify-imu includes imu_check proof.
+ /// Old clients must not infer verification from operator confirmation alone.
+-/// API44 的本地头部核验扩展需配套 Studio、算法库和专用核验报告；不等于 RC4 发行版。
+-pub const API_VERSION: u32 = 44;
++/// API45 的通电站姿头部核验扩展需配套 Studio、算法库和专用核验报告；不等于 RC4 发行版。
++pub const API_VERSION: u32 = 45;
+ 
+ /// The observation width every policy this robot family runs is built against.
+ ///
+diff --git a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+index 8449c81..e3d48f6 100644
+--- a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+@@ -22,12 +22,16 @@ use std::time::{Duration, Instant};
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::sync::oneshot;
+ 
+-pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.3";
++pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.4";
+ const MAX_PENDING: usize = 16;
+ const POSITION_TOLERANCE: u16 = 8;
+ const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
+ type Reply = Result<Value, String>;
+ 
++#[path = "head_imu_standing.rs"]
++mod head_standing;
++use head_standing::StandingCalibration;
++
+ #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
+ #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+ pub enum BusCommand {
+@@ -703,6 +707,12 @@ fn step_hold(
+             }
+             HoldStage::Holding => {
+                 h.max_error = hold_error(samples, ids, &h.targets);
++                // 自动头部测试只更新 Hold 的目标；串口仍由本处唯一写入，避免两套控制争抢。
++                if h.last_written.as_ref() != Some(&h.targets) {
++                    let rows = ids.iter().copied().zip(h.targets.iter().copied()).collect::<Vec<_>>();
++                    bus.signed_positions(&rows).map_err(|error| error.to_string())?;
++                    h.last_written = Some(h.targets.clone());
++                }
+             }
+         }
+         Ok(())
+@@ -1013,19 +1023,21 @@ fn save_verified(
+ #[allow(clippy::too_many_arguments)]
+ fn process_head_job(
+     job: Job,
+-    session: &mut Option<duck_control::head_calibration::Session>,
++    session: &mut Option<StandingCalibration>,
+     calibration: &mut Calibration,
+     path: &Path,
+     source: TrunkImuKind,
+     library: Option<&str>,
+     safe: bool,
++    hold: &mut Option<Hold>,
++    samples: &BTreeMap<u8, ServoSample>,
+ ) {
+     if job.reply.is_closed() {
+         return;
+     }
+     let BusCommand::HeadImuCalibration {
+         operation,
+-        step,
++        step: _,
+         confirmed,
+     } = job.command
+     else {
+@@ -1041,41 +1053,53 @@ fn process_head_job(
+         if operation == "status" {
+             return session.as_mut().map_or_else(
+                 || Ok(json!({"active":false,"contract":duck_control::head_calibration::CONTRACT})),
+-                |session| {
+-                    session.capture(0, false).map(|mut status| {
+-                        status["active"] = json!(true);
+-                        status
+-                    })
+-                },
++                StandingCalibration::status,
+             );
+         }
+         if !confirmed {
+             return Err("请明确确认按当前步骤固定机身或头部；未保存".into());
+         }
+-        if operation == "cancel" {
+-            *session = None;
+-            return Ok(json!({"active":false,"cancelled":true}));
++        if operation == "cancel" || operation == "pause" {
++            if let Some(current) = session.as_mut() {
++                current.pause(
++                    hold.as_mut(),
++                    samples,
++                    "已停止采集和头部轨迹，通电站姿保持未解除",
++                );
++            }
++            if operation == "cancel" {
++                *session = None;
++                return Ok(json!({"active":false,"cancelled":true}));
++            }
++            return session.as_mut().ok_or("没有活动核验会话")?.status();
+         }
+-        if !safe {
+-            return Err("头部校验需要十五颗舵机已断力、没有移动或其他标定任务".into());
++        if !safe
++            || hold
++                .as_ref()
++                .is_none_or(|hold| hold.stage != HoldStage::Holding)
++        {
++            return Err("请先使用站姿使能，等待十五颗舵机保持站姿；核验期间不用卸力".into());
+         }
+         if operation == "start" {
+-            let created = duck_control::head_calibration::Session::new(
++            if session.is_some() {
++                return Err("已有核验会话，请先停止或取消，不能反复开始".into());
++            }
++            *session = Some(StandingCalibration::new(
+                 library.ok_or("未配置头部算法库")?,
+                 calibration,
+-            )?;
+-            *session = Some(created);
+-        } else if operation != "capture" && operation != "save" {
+-            return Err("未知的头部校验操作".into());
++                hold.as_ref().unwrap(),
++            )?);
++        } else if operation != "resume" && operation != "test" && operation != "save" {
++            return Err("未知的头部校验操作；采集由主控自动完成".into());
+         }
+         let current = session.as_mut().ok_or("头部校验会话已结束，请重新开始")?;
+-        if operation == "capture" {
+-            return current.capture(step, true).map(|mut status| {
+-                status["active"] = json!(true);
+-                status
+-            });
++        if operation == "resume" || operation == "test" {
++            current.resume(operation == "test")?;
+         }
+-        let mut status = current.capture(0, false)?;
++        if operation != "save" {
++            return current.status();
++        }
++        let mut status = current.core.capture(0, false)?;
+         status["active"] = json!(true);
+         if operation != "save" {
+             return Ok(status);
+@@ -1085,7 +1109,7 @@ fn process_head_job(
+             return Err("十步真实核验尚未完成，未保存".into());
+         }
+         // 同一会话的最后实测必须仍新鲜；状态查询本身不能刷新证据。
+-        current.require_fresh()?;
++        current.core.require_fresh()?;
+         let mount: [f64; 4] =
+             serde_json::from_value(status["mount"].clone()).map_err(|error| error.to_string())?;
+         status["source"] = json!("head_bmi088");
+@@ -1693,7 +1717,7 @@ pub async fn run(
+     let mut raw_reading = None;
+     let mut raw_sequence = None;
+     let mut verifying: Option<PendingVerify> = None;
+-    let mut head_session: Option<duck_control::head_calibration::Session> = None;
++    let mut head_session: Option<StandingCalibration> = None;
+     let mut last_sample = None;
+     let mut last_failure = None;
+     let mut errors_by_id = BTreeMap::<u8, u64>::new();
+@@ -1732,7 +1756,7 @@ pub async fn run(
+                     head.observe(samples.iter().map(|(id, sample)| (*id, sample)), now).map_err(|error| error.to_string())?;
+                     let raw = host.latest();
+                     if let (Some(session), Some(sample)) = (head_session.as_mut(), raw) {
+-                        if let Err(error) = session.observe(head, sample, &calibration, now) {
++                        if let Err(error) = session.core.observe(head, sample, &calibration, now) {
+                             tracing::warn!("head calibration invalidated: {error}");
+                             head_session = None;
+                         }
+@@ -1840,6 +1864,9 @@ pub async fn run(
+             });
+             state.imu_ready.store(false, Ordering::Relaxed);
+             let consecutive = state.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
++            if let Some(current) = head_session.as_mut() {
++                current.pause(hold.as_mut(), &samples, error);
++            }
+             if motion.is_some() {
+                 off_pending = abort_motion(&mut bus, &ids, &mut motion, error);
+             }
+@@ -1855,9 +1882,9 @@ pub async fn run(
+             }
+             while let Some(job) = state.bus_commands.pop() {
+                 if matches!(&job.command, BusCommand::HeadImuCalibration { operation, .. }
+-                    if operation == "cancel" || operation == "status") {
++                    if operation == "cancel" || operation == "pause" || operation == "status") {
+                     process_head_job(job, &mut head_session, &mut calibration, calibration_path,
+-                        source, host_imu.and_then(|host| host.head_estimator_library()), false);
++                        source, host_imu.and_then(|host| host.head_estimator_library()), false, &mut hold, &samples);
+                 } else if matches!(job.command, BusCommand::Relax) {
+                     head_session = None;
+                     process_job(
+@@ -1947,7 +1974,7 @@ pub async fn run(
+                 if head_command {
+                     process_head_job(job, &mut head_session, &mut calibration, calibration_path,
+                         source, host_imu.and_then(|host| host.head_estimator_library()),
+-                        motion.is_none() && hold.is_none() && off_pending.is_none() && verifying.is_none());
++                        motion.is_none() && off_pending.is_none() && verifying.is_none(), &mut hold, &samples);
+                 } else if head_session.is_some() && !matches!(job.command,
+                     BusCommand::Relax | BusCommand::CalibrationStatus | BusCommand::Reboot {} | BusCommand::Shutdown {}) {
+                     let _ = job.reply.send(Err("头部校验期间不能移动或写关节；先取消校验".into()));
+@@ -1988,6 +2015,9 @@ pub async fn run(
+                     imu_frame = TrunkFrame::new(calibration.control_imu_mount(source));
+                 }
+             }
++            if let Some(current) = head_session.as_mut() {
++                current.tick(hold.as_mut(), &samples, Instant::now());
++            }
+             step_motion(&mut bus, &samples, &ids, &mut motion, &mut off_pending);
+             step_hold(&mut bus, &samples, &ids, &mut hold, &mut off_pending);
+         }
+@@ -2042,6 +2072,7 @@ pub async fn run(
+         // A settled hold is standing, not moving: safe to restart, as motion's standing is.
+         state.moving.store(
+             motion.is_some()
++                || head_session.as_ref().is_some_and(StandingCalibration::running)
+                 || off_pending.is_some()
+                 || hold.as_ref().is_some_and(|h| h.stage != HoldStage::Holding),
+             Ordering::Relaxed,
+@@ -2113,7 +2144,7 @@ pub async fn run(
+                             .is_ok()),
+                 imu_bus: bus.imu_info(),
+                 imu_verification: if head_session.is_some() {
+-                    Some("head-imu: calibration session active; motors remain off")
++                    Some("head-imu: standing calibration session active; HOME position hold")
+                 } else {
+                     verifying.as_ref().map(|_| "verify-imu: tip the robot nose-down by 15-30 degrees and hold it")
+                 },
+@@ -2185,9 +2216,9 @@ pub async fn run(
+ mod tests {
+     use super::*;
+ 
+-    /// 头部保存必须来自真实会话；未确认、未完成和未断力均不能改变标定或创建证明文件。
++    /// 头部保存必须来自真实会话；未确认、未完成和没有站姿保持均不能改变标定或创建证明文件。
+     #[test]
+-    fn head_calibration_requires_confirmation_session_and_torque_off() {
++    fn head_calibration_requires_confirmation_session_and_standing_hold() {
+         let mut calibration = Calibration::commissioning(JOINT_IDS);
+         let before = serde_json::to_value(&calibration).unwrap();
+         let mut session = None;
+@@ -2215,6 +2246,8 @@ mod tests {
+                 TrunkImuKind::HeadBmi088,
+                 None,
+                 safe,
++                &mut None,
++                &BTreeMap::new(),
+             );
+             assert!(result.try_recv().unwrap().is_err());
+             assert_eq!(serde_json::to_value(&calibration).unwrap(), before);
+diff --git a/microduck-hd1910/firmware/robotd/src/feetech_commissioning_bus_verify_tests.rs b/microduck-hd1910/firmware/robotd/src/feetech_commissioning_bus_verify_tests.rs
+index d93296e..4219e86 100644
+--- a/microduck-hd1910/firmware/robotd/src/feetech_commissioning_bus_verify_tests.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_commissioning_bus_verify_tests.rs
+@@ -35,7 +35,7 @@ fn bus_verify_publishes_the_independent_contract() {
+         TrunkImuKind::Bus,
+     );
+     assert_eq!(status["imu_verification_contract"], "upright_nose_down_v1");
+-    assert_eq!(duck_ipc_proto::API_VERSION, 44);
++    assert_eq!(duck_ipc_proto::API_VERSION, 45);
+ }
+ 
+ #[test]
+diff --git a/microduck-hd1910/firmware/robotd/src/head_imu_standing.rs b/microduck-hd1910/firmware/robotd/src/head_imu_standing.rs
+new file mode 100644
+index 0000000..987873e
+--- /dev/null
++++ b/microduck-hd1910/firmware/robotd/src/head_imu_standing.rs
+@@ -0,0 +1,380 @@
++//! 通电站姿下的头部核验调度；串口目标仍只由 commissioning 的 Hold 写入。
++use super::*;
++
++const PAGE_LEASE: Duration = Duration::from_millis(2500);
++const STEP_TIMEOUT: Duration = Duration::from_secs(60);
++const PREPARE_TIME: Duration = Duration::from_secs(3);
++const CAPTURE_INTERVAL: Duration = Duration::from_millis(200);
++const SWEEP_TIME: Duration = Duration::from_secs(8);
++const SWEEP_COUNTS: i32 = 57; // 4096 count/rev，约 ±5°；不使用网页传入的幅度。
++
++/// 有界单关节轨迹，中心来自已稳定的站姿目标；不改其他十四颗目标。
++#[derive(Clone)]
++struct Sweep {
++    index: usize,
++    id: u8,
++    from: i32,
++    center: i32,
++    started: Instant,
++}
++
++impl Sweep {
++    /// 连续经过 +5°、-5°、中心；每段线性慢速，最后一段回中心。
++    fn target(&self, now: Instant) -> i32 {
++        let seconds = now.saturating_duration_since(self.started).as_secs_f64();
++        let (from, to, fraction) = if seconds < 2.0 {
++            (self.from, self.center + SWEEP_COUNTS, seconds / 2.0)
++        } else if seconds < 6.0 {
++            (
++                self.center + SWEEP_COUNTS,
++                self.center - SWEEP_COUNTS,
++                (seconds - 2.0) / 4.0,
++            )
++        } else {
++            (
++                self.center - SWEEP_COUNTS,
++                self.center,
++                ((seconds - 6.0) / 2.0).min(1.0),
++            )
++        };
++        (f64::from(from) + f64::from(to - from) * fraction).round() as i32
++    }
++}
++
++/// 同一主控循环独占几何会话、采集进度、页面租约与当前轨迹；暂停保留已通过步骤。
++pub(super) struct StandingCalibration {
++    pub core: duck_control::head_calibration::Session,
++    running: bool,
++    testing: bool,
++    next_step: u32,
++    heartbeat: Instant,
++    not_before: Instant,
++    step_started: Instant,
++    attempted: Instant,
++    sweep: Option<Sweep>,
++    centers: Vec<i32>,
++    message: String,
++}
++
++impl StandingCalibration {
++    /// 只在已有 HOME 保持就绪且头颈方向与持久配置一致时创建，不自动使能电机。
++    pub fn new(library: &str, calibration: &Calibration, hold: &Hold) -> Result<Self, String> {
++        if hold.stage != HoldStage::Holding {
++            return Err("先等待通电站姿保持完成".into());
++        }
++        for id in [30, 31, 32, 33] {
++            let index = JOINT_IDS
++                .iter()
++                .position(|value| *value == id)
++                .ok_or("头颈 ID 缺失")?;
++            let joint = calibration
++                .joints
++                .iter()
++                .find(|joint| joint.id == id)
++                .ok_or("头颈配置缺失")?;
++            if hold.directions.get(index) != Some(&joint.direction) {
++                return Err(format!(
++                    "ID{id} 的站姿方向与主控保存方向不一致，请先核对方向配置"
++                ));
++            }
++            // 允许无历史限位的 commissioning，但测试只能围绕既有 HOME 小幅运动。
++            for raw in [
++                hold.targets[index] - SWEEP_COUNTS,
++                hold.targets[index] + SWEEP_COUNTS,
++            ] {
++                let angle = f64::from(raw - i32::from(joint.zero_raw))
++                    * f64::from(joint.direction)
++                    * std::f64::consts::TAU
++                    / 4096.0;
++                if !(0..=4095).contains(&raw)
++                    || joint.min_rad.is_some_and(|minimum| angle < minimum)
++                    || joint.max_rad.is_some_and(|maximum| angle > maximum)
++                {
++                    return Err(format!("ID{id} 的 ±5° 测试超出已有范围，不开始测试"));
++                }
++            }
++        }
++        let now = Instant::now();
++        Ok(Self {
++            core: duck_control::head_calibration::Session::new(library, calibration)?,
++            running: true,
++            testing: false,
++            next_step: 0,
++            heartbeat: now,
++            not_before: now + PREPARE_TIME,
++            step_started: now,
++            attempted: now,
++            sweep: None,
++            centers: hold.targets.clone(),
++            message: "站姿保持，准备采集静止基准".into(),
++        })
++    }
++
++    /// 供主控安全重启门槛查询；采集或测试运行时不允许更新器重启。
++    pub fn running(&self) -> bool {
++        self.running
++    }
++
++    /// 前台状态请求续租；读取本身不采集、不推进、不启动轨迹。
++    pub fn status(&mut self) -> Result<Value, String> {
++        self.heartbeat = Instant::now();
++        let mut status = self.core.capture(0, false)?;
++        status["active"] = json!(true);
++        status["running"] = json!(self.running);
++        status["testing"] = json!(self.testing);
++        status["message"] = json!(self.message);
++        status["countdown_s"] = json!(
++            self.not_before
++                .saturating_duration_since(Instant::now())
++                .as_secs_f64()
++                .ceil()
++        );
++        status["test_joint"] = self
++            .sweep
++            .as_ref()
++            .map_or(Value::Null, |sweep| json!(sweep.id));
++        Ok(status)
++    }
++
++    /// 显式开始桌面站姿自动测试，或重试当前阶段；三秒准备后才产生目标变化。
++    pub fn resume(&mut self, testing: bool) -> Result<(), String> {
++        if self.running {
++            return Err("采集或测试正在运行，请先停止".into());
++        }
++        if testing != (self.next_step >= 5) || self.next_step >= 10 {
++            return Err("请按当前阶段操作，不可跳过整机采集或重复已完成测试".into());
++        }
++        self.testing = testing;
++        self.running = true;
++        self.heartbeat = Instant::now();
++        self.not_before = self.heartbeat + PREPARE_TIME;
++        self.step_started = self.heartbeat;
++        self.message = "请保持鸭子站在桌面上，等待倒计时".into();
++        Ok(())
++    }
++
++    /// 停止轨迹并把当前测试关节目标冻结在实测位置；身体仍由原 Hold 保持，不自动回中心。
++    pub fn pause(
++        &mut self,
++        hold: Option<&mut Hold>,
++        samples: &BTreeMap<u8, ServoSample>,
++        reason: &str,
++    ) {
++        if let (Some(sweep), Some(hold)) = (self.sweep.take(), hold) {
++            if let Some(sample) = samples.get(&sweep.id) {
++                hold.targets[sweep.index] = i32::from(sample.feedback.position_raw);
++            }
++        }
++        self.running = false;
++        self.message = reason.into();
++    }
++
++    /// 成功读数后的唯一调度入口；故障或租约过期会停止，不因轮询自动恢复。
++    pub fn tick(
++        &mut self,
++        hold: Option<&mut Hold>,
++        samples: &BTreeMap<u8, ServoSample>,
++        now: Instant,
++    ) {
++        let Some(hold) = hold else {
++            self.pause(None, samples, "站姿保持已结束，测试停止；重新站稳后再开始");
++            return;
++        };
++        if !self.running {
++            return;
++        }
++        if now.saturating_duration_since(self.heartbeat) > PAGE_LEASE {
++            self.pause(
++                Some(hold),
++                samples,
++                "页面已离开或连接中断，采集停止，站姿保持未解除",
++            );
++            return;
++        }
++        if now.saturating_duration_since(self.step_started) > STEP_TIMEOUT {
++            self.pause(
++                Some(hold),
++                samples,
++                "当前步骤超过一分钟，已停止；调整后重试当前步骤",
++            );
++            return;
++        }
++        if now < self.not_before {
++            return;
++        }
++        if let Err(error) = self.core.require_fresh() {
++            self.pause(Some(hold), samples, &error);
++            return;
++        }
++        if self.testing && self.next_step >= 6 {
++            if self.sweep.is_none() {
++                let id = 30 + (self.next_step - 6) as u8;
++                let index = JOINT_IDS.iter().position(|value| *value == id).unwrap();
++                let Some(sample) = samples.get(&id) else {
++                    self.pause(Some(hold), samples, "缺少当前头颈关节反馈，测试停止");
++                    return;
++                };
++                self.sweep = Some(Sweep {
++                    id,
++                    index,
++                    from: i32::from(sample.feedback.position_raw),
++                    center: self.centers[index],
++                    started: now,
++                });
++            }
++            let sweep = self.sweep.as_ref().unwrap();
++            if (i32::from(samples[&sweep.id].feedback.position_raw) - hold.targets[sweep.index])
++                .abs()
++                > 34
++            {
++                self.pause(
++                    Some(hold),
++                    samples,
++                    "测试关节跟随误差超过 3°，已停止；检查干涉和舵机反馈",
++                );
++                return;
++            }
++            hold.targets[sweep.index] = sweep.target(now);
++            self.message = format!("自动测试 ID{}，请保持机身站稳；不要手动掰头部", sweep.id);
++            if now.saturating_duration_since(sweep.started) < SWEEP_TIME {
++                return;
++            }
++        }
++        if now.saturating_duration_since(self.attempted) < CAPTURE_INTERVAL {
++            return;
++        }
++        self.attempted = now;
++        match self.core.capture(self.next_step, true) {
++            Err(error) => {
++                if self.sweep.is_some() {
++                    self.pause(Some(hold), samples, &error);
++                } else {
++                    self.message = error;
++                }
++            }
++            Ok(status) => {
++                self.next_step = status["next_step"].as_u64().unwrap() as u32;
++                self.sweep = None;
++                self.step_started = now;
++                self.not_before = now
++                    + if self.testing {
++                        PREPARE_TIME
++                    } else {
++                        Duration::ZERO
++                    };
++                self.message = "这一步已采好，请按下一步提示操作".into();
++                if self.next_step == 5 || self.next_step == 10 {
++                    self.running = false;
++                    self.message = if self.next_step == 5 {
++                        "整机采集通过。请放回桌面保持站立，再明确开始自动头部测试。"
++                    } else {
++                        "头部测试完成。请单独确认保存，当前仍保持通电站姿。"
++                    }
++                    .into();
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// 确认自动轨迹连续、有界、按时回中心；只比较原始 count，不创建串口。
++    #[test]
++    fn sweep_is_slow_bounded_and_returns_to_standing_center() {
++        let start = Instant::now();
++        let sweep = Sweep {
++            index: 0,
++            id: 30,
++            from: 2048,
++            center: 2048,
++            started: start,
++        };
++        assert_eq!(sweep.target(start), 2048);
++        assert_eq!(sweep.target(start + Duration::from_secs(2)), 2105);
++        assert_eq!(sweep.target(start + Duration::from_secs(6)), 1991);
++        assert_eq!(sweep.target(start + SWEEP_TIME), 2048);
++        let targets: Vec<_> = (0..=400)
++            .map(|tick| sweep.target(start + Duration::from_millis(tick * 20)))
++            .collect();
++        assert!(targets.iter().all(|target| (1991..=2105).contains(target)));
++        assert!(
++            targets
++                .windows(2)
++                .all(|pair| (pair[1] - pair[0]).abs() <= 1)
++        );
++    }
++    /// 使用真实 C ABI 空会话和模拟关节反馈验证停止/失联行为，不创建 Bus 或串口。
++    #[test]
++    #[ignore = "requires MICRODUCK_HEAD_CORE_TEST_LIB; run verify-native.sh"]
++    fn stopping_or_expired_page_freezes_only_the_test_joint_and_never_resumes() {
++        let library = std::env::var("MICRODUCK_HEAD_CORE_TEST_LIB").unwrap();
++        let calibration = Calibration::commissioning(JOINT_IDS);
++        let mut hold = Hold {
++            from: vec![2048; 15],
++            targets: vec![2048; 15],
++            directions: calibration
++                .joints
++                .iter()
++                .map(|joint| joint.direction)
++                .collect(),
++            started: Instant::now(),
++            duration: PREPARE_TIME,
++            stage: HoldStage::Holding,
++            reply: None,
++            last_written: Some(vec![2048; 15]),
++            max_error: 0,
++        };
++        let index = JOINT_IDS.iter().position(|id| *id == 30).unwrap();
++        let mut raw = [0u8; 15];
++        raw[..2].copy_from_slice(&2055u16.to_le_bytes());
++        let samples = [(30, ServoSample::decode(&raw).unwrap())]
++            .into_iter()
++            .collect();
++        for expired in [false, true] {
++            hold.targets.fill(2048);
++            let mut run = StandingCalibration::new(&library, &calibration, &hold).unwrap();
++            run.next_step = 6;
++            run.testing = true;
++            run.sweep = Some(Sweep {
++                index,
++                id: 30,
++                from: 2048,
++                center: 2048,
++                started: Instant::now(),
++            });
++            hold.targets[index] = 2070;
++            if expired {
++                run.heartbeat = Instant::now() - PAGE_LEASE - Duration::from_millis(1);
++                run.tick(Some(&mut hold), &samples, Instant::now());
++            } else {
++                run.pause(Some(&mut hold), &samples, "operator stop");
++            }
++            assert!(!run.running());
++            assert!(run.sweep.is_none());
++            assert_eq!(hold.targets[index], 2055);
++            assert!(
++                hold.targets
++                    .iter()
++                    .enumerate()
++                    .all(|(i, target)| i == index || *target == 2048)
++            );
++            let before = hold.targets.clone();
++            run.status().unwrap();
++            run.tick(
++                Some(&mut hold),
++                &samples,
++                Instant::now() + Duration::from_secs(1),
++            );
++            assert!(!run.running());
++            assert_eq!(hold.targets, before);
++            assert!(matches!(hold.stage, HoldStage::Holding));
++            assert!(run.resume(false).is_err());
++            run.resume(true).unwrap();
++            assert!(run.running() && run.sweep.is_none());
++            assert!(run.not_before > Instant::now());
++        }
++    }
++}

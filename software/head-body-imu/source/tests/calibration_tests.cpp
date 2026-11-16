@@ -65,7 +65,7 @@ namespace
             for (int joint = 0; joint < 4; ++joint)
             {
                 const double initial = joint < 2 ? 0.25 : 0.0;
-                const double amplitude = joint == active ? 0.16 : 0.0;
+                const double amplitude = joint == active ? 0.09 : 0.0;
                 const double previous = initial + amplitude * std::sin(sample * 0.04);
                 const double current = initial + amplitude * std::sin((sample + 1) * 0.04);
                 pair.zeroRaw[joint] = 2048;
@@ -100,9 +100,18 @@ namespace
     /** 拟合三个姿态及独立直立基准；用于成功与故障用例共用相同准备条件。 */
     void prepare(void* handle, unsigned long long& timeNs)
     {
-        const Rotation poses[] = {{1.0, 0.0, 0.0, 0.0}, tilted(1, 20.0), tilted(0, -20.0), {1.0, 0.0, 0.0, 0.0}};
-        for (unsigned int step = 0; step < 4; ++step)
+        const Rotation poses[] = {{1.0, 0.0, 0.0, 0.0},
+                                  tilted(1, 20.0),
+                                  tilted(1, -20.0),
+                                  tilted(0, -20.0),
+                                  tilted(0, 20.0),
+                                  {1.0, 0.0, 0.0, 0.0}};
+        for (unsigned int step = 0; step < 6; ++step)
         {
+            if (step > 0 && step < 5)
+            {
+                feed(handle, timeNs, {1.0, 0.0, 0.0, 0.0});
+            }
             feed(handle, timeNs, poses[step]);
             MicroduckHeadCalibrationStatus status{};
             const int code = microduck_head_calibration_capture(handle, step, 1, &status);
@@ -123,10 +132,10 @@ namespace
         unsigned long long timeNs = 1000000000;
         prepare(handle, timeNs);
         MicroduckHeadCalibrationStatus status{};
-        for (unsigned int step = 4; step < 10; ++step)
+        for (unsigned int step = 6; step < 10; ++step)
         {
-            const auto pose = step == 8 ? tilted(1, 20.0) : (step == 9 ? tilted(0, -20.0) : tilted(2, 30.0));
-            feed(handle, timeNs, pose, step < 8 ? static_cast<int>(step) - 4 : -1);
+            const auto pose = tilted(2, 30.0);
+            feed(handle, timeNs, pose, static_cast<int>(step) - 6);
             const int code = microduck_head_calibration_capture(handle, step, 1, &status);
             if (code != 0)
             {
@@ -153,7 +162,7 @@ namespace
     /** 缺少运动、反向关节以及漏减角速度均不得推进核验。 */
     void rejectInvalidEvidence()
     {
-        for (int fault = 0; fault < 3; ++fault)
+        for (int fault = 0; fault < 12; ++fault)
         {
             void* handle = microduck_head_calibration_create();
             unsigned long long timeNs = 1000000000;
@@ -161,11 +170,45 @@ namespace
             require(microduck_head_calibration_capture(handle, 0, 1, &status) != 0, "no samples rejected");
             require(microduck_head_calibration_capture(handle, 2, 1, &status) != 0, "cannot skip step");
             prepare(handle, timeNs);
-            feed(handle, timeNs, {1.0, 0.0, 0.0, 0.0}, fault == 0 ? -1 : 0, fault == 1, fault == 2);
-            require(microduck_head_calibration_capture(handle, 4, 1, &status) != 0, "bad head evidence rejected");
-            require(status.nextStep == 4, "failed evidence never advances or verifies");
+            for (int previous = 0; previous < fault / 3; ++previous)
+            {
+                feed(handle, timeNs, {1.0, 0.0, 0.0, 0.0}, previous);
+                require(microduck_head_calibration_capture(handle, 6 + previous, 1, &status) == 0,
+                        "previous joint passes before next fault");
+            }
+            feed(handle, timeNs, {1.0, 0.0, 0.0, 0.0}, fault % 3 == 0 ? -1 : fault / 3, fault % 3 == 1, fault % 3 == 2);
+            require(microduck_head_calibration_capture(handle, 6 + fault / 3, 1, &status) != 0,
+                    "bad head evidence rejected");
+            require(status.nextStep == static_cast<unsigned int>(6 + fault / 3),
+                    "failed evidence never advances or verifies");
             microduck_head_calibration_destroy(handle);
         }
+    }
+    /** 没有回正、前后重复或左右反向不能被自动采集当成正确步骤。 */
+    void rejectTiltLabelsAndMissingReturn()
+    {
+        void* handle = microduck_head_calibration_create();
+        unsigned long long timeNs = 1000000000;
+        MicroduckHeadCalibrationStatus status{};
+        feed(handle, timeNs, {1.0, 0.0, 0.0, 0.0});
+        require(microduck_head_calibration_capture(handle, 0, 1, &status) == 0, "upright fit");
+        feed(handle, timeNs, tilted(1, 20));
+        require(microduck_head_calibration_capture(handle, 1, 1, &status) != 0, "return level required");
+        const Rotation good[] = {tilted(1, 20), tilted(1, -20), tilted(0, -20), tilted(0, 20)};
+        for (unsigned int step = 1; step < 5; ++step)
+        {
+            if (step > 1)
+            {
+                feed(handle, timeNs, {1.0, 0.0, 0.0, 0.0});
+                feed(handle, timeNs, good[step - 2]);
+                require(microduck_head_calibration_capture(handle, step, 1, &status) != 0, "wrong tilt label rejected");
+                require(status.nextStep == step, "wrong tilt never advances");
+            }
+            feed(handle, timeNs, {1.0, 0.0, 0.0, 0.0});
+            feed(handle, timeNs, good[step - 1]);
+            require(microduck_head_calibration_capture(handle, step, 1, &status) == 0, "correct tilt after retry");
+        }
+        microduck_head_calibration_destroy(handle);
     }
 } // namespace
 
@@ -174,5 +217,6 @@ int main()
 {
     completeCalibration();
     rejectInvalidEvidence();
+    rejectTiltLabelsAndMissingReturn();
     std::printf("%u calibration assertions passed\n", assertions);
 }

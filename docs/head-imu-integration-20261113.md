@@ -276,3 +276,70 @@ sudo sh /var/backups/microduck/20261113-head-imu-calibration-v3/rollback-calibra
 回退会核对本次覆盖与全部设备配置的最终摘要，并要求仍处于断力标定状态。
 用户随后保存核验或改配置后，脚本会拒绝自动回退，防止覆盖新成果。
 该入口已静态检查，未为演示回退而切换正常服务。
+
+## 第四阶段：通电站姿采集与自动头部测试（2026-11-16）
+
+旧 `.3` 的断力手扶流程难以单人完成，已由用户确认的两阶段流程替代：
+先复用原站姿使能，自动采集站立摆正及四向倾斜；再放回桌面继续站立，单独确认自动测试四个头颈关节。
+新主控通过同一 Hold 更新目标，正常停止保留站姿，前台续租超时停止轨迹，保存仍需明确确认。
+操作、门限与限制以[当前核验说明](head-imu-calibration-20261113.md)为准。
+
+### 源码和本地证据
+
+第四个增量为 `standing-head-calibration.patch`，在前三个补丁上修改五个原文件并新增
+`robotd/src/head_imu_standing.rs`。主控本地版本 `.4`、IPC API45、校准 C ABI v2（352 字节）；
+估计 ABI v1 和固定躯干验证路径保持原有语义。新版只认可 `head_mount_standing_v2` 证明。
+
+本次重建使用已有离线 Rust 1.99.0、cargo-zigbuild 0.23.4 和 Zig 0.15.2；
+robotd 的目标为 `aarch64-unknown-linux-gnu.2.31`。构建树中带补丁 postimage 摘要的 23 个文件
+全部匹配最终源码补丁，四个补丁自身 SHA256 校验通过，Studio 包的 370 个文件与仓库逐字节一致。
+
+本次安装前再次执行统一本地入口：C++ 估计器 1693、站姿校验器 47042 个断言通过，
+36 项 Python 与 2 项 JS 检查通过；头部专项另跑 9 项通过。
+新版模拟浏览器验证自动采齐、头部阶段单独确认、失败留步、停止后不自动恢复、明确保存和离页停止轮询，通过。
+完整 Studio 套件在当前主机仍有浏览器/HTTP 用例失败，本次没有据此宣称全库通过。
+原生头部专项和动态库用例的本轮构建验证见本机私有 `build-20261116.md`；
+此前开发期间的 782 项选定 Rust 回归与实物动作验收是不同证据。
+
+### 安装前修正及板端更新
+
+预检发现先前上传的动态库误用本机 x86-64 构建（`994f6651...dd99f`）。
+该文件没有被安装或加载到服务；改用 Zig 为 `aarch64-linux-gnu.2.31` 重建库及两组测试，
+更新激活脚本摘要，先在鸭子上确认动态加载和 1693/47042 断言均通过后才切换。
+
+| 最终产物 | SHA256 |
+| --- | --- |
+| robotd `control.48-head-bmi088.4` | `31275ae07bc8ef1b75cc7c5c9bcb17a81dc375c5d576bd2b951ccb016966fe54` |
+| ARM64 C++ 库 | `08eba418da4272a3a54a18c35692f322d6b8ad3541c4f54effe1c8db01953686` |
+| Studio `2026.11.13-head-imu.3` 包 | `a90e7f7b6f75b8944df739176bd304325593b1c27896746fcee68c742a8bdc06` |
+| 更新前设备备份 | `d6f99f19b915186f88aafef9528977f99393840ac312aca135b2e276cfdc484e` |
+
+激活脚本在维护锁内备份原组件、全部 `/etc/robot`、服务及覆盖、helper 和 Studio 状态。
+安装到 `/opt/microduck/local-components/head-body-v4/` 与 `studio-head-standing-v4/`，
+只修改设备配置中的 `trunk_imu.head_estimator_library`，并切换主控、Studio 和 helper 路径。
+保留 `--commissioning`；舵机零位、方向、限位及 IMU 安装未核验标志没有改变。
+校准文件摘要仍为 `62d52690cb9950451db909e5cac033b6a7c60b479086c56b04c143b9fbec0871`。
+
+主控与 Studio 已重启为新版本，两者 active、NRestarts=0，传感器 tofd 与手柄 padd 实例未变。
+切换后 50 次只读采样均断力、15 颗舵机反馈有效；cycle 增加 260、IMU 序号增加 258，
+最大 IMU 年龄 20.80 ms，约 49.98 Hz。API 回读 45，专用会话 inactive、没有核验报告。
+
+### 实际网页及备份
+
+实际网页登录只读验收通过：原站姿使能入口可用、新通电站姿提示可见，
+未站姿使能及确认前采集按钮禁用；HAT 序号推进、约 49.6 Hz、采样年龄 12 ms。
+手机宽度无横向溢出，离开 IMU 页停止 HAT 轮询，无未捕获网页异常。
+首次隔离浏览器缺少 WebGL，启用该测试浏览器的软件 WebGL 后通过；未为此修改产品程序。
+
+没有开始真实站姿、安装采集、自动头部测试、核验保存或任何走路动作。
+实物操作体验、补偿精度及机械间隙仍需用户现场确认，不能由上述软件检查代替。
+
+板端备份路径沿用预定事务名 `/var/backups/microduck/20261113-head-imu-standing-v4/`，
+实际执行日期为 2026-11-16。本机第二份位于 `microduck env/device-backups/20261113-head-imu-standing-v4/`，
+日志和截图位于 `microduck env/device-validation/20261113-head-imu-standing-v4/`，不纳入 Git。
+下载归档 SHA256 为 `f56db62a3990f9716344292df0c8e3fd6d1722eb3913b185f4fe46321e77add0`，
+与其中原设备备份分别复核一致。
+
+回退入口为 `sudo sh /var/backups/microduck/20261113-head-imu-standing-v4/rollback-standing.sh`。
+它要求部署文件、全部设备配置未被再次改变且仍断力，才恢复 `.3` 主控及 `.2` Studio；
+用户随后保存核验或改配置后会拒绝自动回退，防止覆盖新结果。入口已语法检查，未实切回退。

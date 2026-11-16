@@ -1103,7 +1103,8 @@ export function ImuPage({ st, imu, link, live, age, diagnosticElapsed = 0, pd })
         <${StatusCard} st=${st} imu=${imu} live=${live} age=${age} diagnosticElapsed=${diagnosticElapsed} />
         <${DiagnosticCard} st=${st} imu=${imu} live=${live} diagnosticElapsed=${diagnosticElapsed} />
         ${imu?.source === 'head_bmi088'
-          ? html`<${HeadCalibrationPanel} imu=${imu} link=${link} live=${live} />`
+          ? html`<${StanceCard} st=${st} imu=${imu} pd=${pd} link=${link} live=${live} />
+        <${HeadCalibrationPanel} imu=${imu} link=${link} live=${live} />`
           : html`<${CoarseCard} st=${st} imu=${imu} link=${link} live=${live} />
         <${StanceCard} st=${st} imu=${imu} pd=${pd} link=${link} live=${live} />
         <${CollectCard} st=${st} imu=${imu} live=${live} W=${w} act=${act} muted=${muted} setMuted=${setMuted} />
