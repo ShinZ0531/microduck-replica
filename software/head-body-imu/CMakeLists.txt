@@ -1,10 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
-project(MicroduckHeadBodyEstimator VERSION 1.2.0 LANGUAGES CXX)
+project(MicroduckHeadBodyEstimator VERSION 1.4.0 LANGUAGES CXX)
 
 include(CTest)
 include(GNUInstallDirs)
 
-add_library(microduck_head_body SHARED source/head_body_estimator.cpp source/head_calibration.cpp)
+add_library(microduck_head_body SHARED source/head_body_estimator.cpp source/head_calibration.cpp
+    source/head_endpoint_verification.cpp)
 target_compile_features(microduck_head_body PUBLIC cxx_std_17)
 set_target_properties(microduck_head_body PROPERTIES
     CXX_EXTENSIONS OFF

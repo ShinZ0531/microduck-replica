@@ -1,0 +1,111 @@
+--- a/microduck-hd1910/firmware/robotd/src/main.rs
++++ b/microduck-hd1910/firmware/robotd/src/main.rs
+@@ -1859,6 +1859,7 @@
+     safety: &mut Safety<T>,
+     state: &RobotState,
+     period: Duration,
++    head_imu: bool,
+ ) -> Option<[f64; NUM_JOINTS]> {
+     let mut attempt = 0u32;
+     // The decoder needs 25 accepted samples. One-second fault backoff between
+@@ -1874,12 +1875,16 @@
+                     if !status.all_joints_fresh || status.joints_held {
+                         state.startup_step(2, "waiting", "等待全部关节的新鲜反馈；未发送目标");
+                         publish_startup_bus_wait(safety, state, "等待全部关节的新鲜反馈；未发送目标");
+-                        tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
++                        tokio::time::sleep(if head_imu { period } else { STARTUP_RETRY_INTERVAL }).await;
+                         continue;
+                     }
+                     if !status.imu_ready {
+                         publish_startup_bus_wait(safety, state, "等待 IMU 数据；确认融合就绪；未发送目标");
+-                        let delay = if imu_confirmation_reads > 0 {
++                        let delay = if head_imu {
++                            // 头部来源要在连续 5–40 ms 编码器对之间对齐；1 秒退避会让历史帧永远超窗。
++                            state.startup_step(2, "waiting", "关节反馈已有效；等待头部 IMU 就绪；未发送目标");
++                            period
++                        } else if imu_confirmation_reads > 0 {
+                             imu_confirmation_reads -= 1;
+                             state.startup_step(2, "waiting", "关节反馈已有效；确认 IMU 融合就绪；未发送目标");
+                             period
+@@ -1918,7 +1923,8 @@
+                         "no answer from the motor bus; waiting, not commanding anything"
+                     );
+                 }
+-                tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
++                // 头部来源的编码器对必须在 5–40 ms 内；1 秒退避会持续产生超窗对，永远起不来。
++                tokio::time::sleep(if head_imu { period } else { STARTUP_RETRY_INTERVAL }).await;
+             }
+         }
+     }
+@@ -2290,7 +2296,8 @@
+         gain_limp: params.safety.gain_limp,
+     });
+     state.startup_step(2, "waiting", "等待第一份有效关节与 IMU 反馈；未发送目标");
+-    let Some(mut hold) = adopt_startup_pose(&mut safety, &state, period).await else { return; };
++    let head_imu = params.trunk_imu.source == params::TrunkImuSource::HeadBmi088;
++    let Some(mut hold) = adopt_startup_pose(&mut safety, &state, period, head_imu).await else { return; };
+     let mut startup_pose_ready = true;
+     state.startup_step(2, "success", "硬件初始化与第一份有效反馈完成");
+     state.startup_step(3, "starting", "加载随包模型配置与推理运行时");
+@@ -6392,7 +6399,7 @@
+         let state = state();
+         let period = Duration::from_millis(20);
+         let began = tokio::time::Instant::now();
+-        assert_eq!(adopt_startup_pose(&mut safety, &state, period).await, Some(DEFAULT_POSITION));
++        assert_eq!(adopt_startup_pose(&mut safety, &state, period, false).await, Some(DEFAULT_POSITION));
+         assert_eq!(reads.load(Ordering::Relaxed), 25);
+         assert_eq!(began.elapsed(), period * 24);
+     }
+@@ -6403,18 +6410,30 @@
+         let state = state();
+         let period = Duration::from_millis(20);
+         let began = tokio::time::Instant::now();
+-        assert!(adopt_startup_pose(&mut safety, &state, period).await.is_some());
++        assert!(adopt_startup_pose(&mut safety, &state, period, false).await.is_some());
+         assert_eq!(reads.load(Ordering::Relaxed), 27);
+         assert_eq!(began.elapsed(), Duration::from_secs(2) + period * 24);
+         assert_eq!(state.startup_bus_failures.load(Ordering::Relaxed), 0);
+     }
+ 
+     #[tokio::test(start_paused = true)]
++    async fn startup_head_imu_retries_at_control_period_to_keep_encoder_pairs_near() {
++        let (mut safety, reads) = startup_warm_io(2, 0, true);
++        let state = state();
++        let period = Duration::from_millis(20);
++        let began = tokio::time::Instant::now();
++        assert!(adopt_startup_pose(&mut safety, &state, period, true).await.is_some());
++        assert_eq!(reads.load(Ordering::Relaxed), 27);
++        assert_eq!(began.elapsed(), period * 26, "head IMU never backs off to one second");
++        assert_eq!(state.startup_bus_failures.load(Ordering::Relaxed), 0);
++    }
++
++    #[tokio::test(start_paused = true)]
+     async fn startup_incomplete_joint_feedback_never_uses_fast_confirmation() {
+         let (mut safety, reads) = startup_warm_io(0, 26, true);
+         let state = state();
+         let began = tokio::time::Instant::now();
+-        assert!(adopt_startup_pose(&mut safety, &state, Duration::from_millis(20)).await.is_some());
++        assert!(adopt_startup_pose(&mut safety, &state, Duration::from_millis(20), false).await.is_some());
+         assert_eq!(reads.load(Ordering::Relaxed), 27);
+         assert_eq!(began.elapsed(), Duration::from_secs(26));
+     }
+@@ -6424,7 +6443,7 @@
+         let (mut safety, reads) = startup_warm_io(0, 0, false);
+         let state = state();
+         let result = tokio::time::timeout(Duration::from_secs(2),
+-            adopt_startup_pose(&mut safety, &state, Duration::from_millis(20))).await;
++            adopt_startup_pose(&mut safety, &state, Duration::from_millis(20), false)).await;
+         assert!(result.is_err(), "zero quaternion must never satisfy startup");
+         assert_eq!(reads.load(Ordering::Relaxed), 26, "only one bounded warmup burst");
+         assert_eq!(state.startup.borrow()["steps"]["2"]["status"], "waiting");
+--- a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+@@ -22,7 +22,7 @@
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::sync::oneshot;
+ 
+-pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.7";
++pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.8";
+ const MAX_PENDING: usize = 16;
+ const POSITION_TOLERANCE: u16 = 8;
+ const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);

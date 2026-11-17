@@ -11,6 +11,10 @@ patches=(
     "$component_dir/patches/runtime-hardening.patch"
     "$component_dir/patches/head-calibration.patch"
     "$component_dir/patches/standing-head-calibration.patch"
+    "$component_dir/patches/endpoint-head-calibration.patch"
+    "$component_dir/patches/skip-yaw.patch"
+    "$component_dir/patches/mount-tolerance.patch"
+    "$component_dir/patches/startup-head-retry.patch"
 )
 
 if [[ $# -lt 1 || $# -gt 2 || ! -d "$runtime_dir" ]]; then

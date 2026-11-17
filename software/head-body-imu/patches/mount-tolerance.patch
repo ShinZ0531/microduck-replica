@@ -1,0 +1,92 @@
+--- a/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
++++ b/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
+@@ -304,6 +304,33 @@
+     }
+ }
+ 
++/// 两个四元数是否表示同一安装；TOML 与 JSON 的浮点解析可能差 1 ULP，不能按位比较。
++fn quat_matches(left: &Value, right: &Value) -> bool {
++    let parse = |value: &Value| -> Option<[f64; 4]> {
++        let items = value.as_array()?;
++        if items.len() != 4 {
++            return None;
++        }
++        let mut quat = [0.0; 4];
++        for (index, item) in items.iter().enumerate() {
++            quat[index] = item.as_f64().filter(|number| number.is_finite())?;
++        }
++        let norm = (quat.iter().map(|number| number * number).sum::<f64>()).sqrt();
++        if !(0.9..=1.1).contains(&norm) {
++            return None;
++        }
++        for number in &mut quat {
++            *number /= norm;
++        }
++        Some(quat)
++    };
++    let (Some(left), Some(right)) = (parse(left), parse(right)) else {
++        return false;
++    };
++    let dot: f64 = (0..4).map(|index| left[index] * right[index]).sum();
++    dot.abs() >= 1.0 - 1e-6
++}
++
+ /// 只认可同一安装四元数、四个头颈关节配置及完整十步的本地主控报告。
+ pub fn verified_proof(path: &Path, calibration: &Calibration) -> Option<Value> {
+     let proof: Value = serde_json::from_slice(&std::fs::read(proof_path(path)).ok()?).ok()?;
+@@ -313,7 +340,7 @@
+         || proof.get("contract")? != CONTRACT
+         || proof.get("source")? != "head_bmi088"
+         || proof.get("binding")? != &binding(calibration)
+-        || proof.get("mount")? != &json!(mount.quat)
++        || !quat_matches(proof.get("mount")?, &json!(mount.quat))
+         || reports.len() != 10
+         || reports
+             .iter()
+@@ -437,6 +464,35 @@
+         std::fs::remove_dir_all(directory).unwrap();
+     }
+ 
++    /// 保存路径的 TOML/JSON 浮点解析可能差一个 ULP；同安装必须接受，真换安装仍拒绝。
++    #[test]
++    fn proof_mount_tolerates_roundtrip_ulp_but_not_another_mount() {
++        let (calibration, mut proof) = fixture();
++        let mount = proof["mount"].as_array().unwrap().clone();
++        let mut changed = mount.clone();
++        changed[0] = serde_json::json!(f64::from_bits(mount[0].as_f64().unwrap().to_bits() ^ 1));
++        proof["mount"] = serde_json::Value::Array(changed);
++        let directory = std::env::temp_dir().join(format!(
++            "head-proof-ulp-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        std::fs::create_dir(&directory).unwrap();
++        let path = directory.join("calibration.toml");
++        save_proof(&path, &proof).unwrap();
++        assert!(verified_proof(&path, &calibration).is_some(), "one ULP is the same mount");
++        let half_degree = 0.5f64.to_radians() / 2.0;
++        let turned = [0.5 * half_degree.cos(), 0.5 * half_degree.cos(),
++                      0.5 * half_degree.cos(), 0.5 * half_degree.sin()];
++        proof["mount"] = serde_json::json!(turned);
++        save_proof(&path, &proof).unwrap();
++        assert!(verified_proof(&path, &calibration).is_none(), "a different mount is rejected");
++        std::fs::remove_dir_all(directory).unwrap();
++    }
++
+     /// 真实库有独立校准 ABI，但创建会话、查询或伪造步号不能替代真实采样。
+     #[test]
+     #[ignore = "requires MICRODUCK_HEAD_CORE_TEST_LIB; run verify-native.sh"]
+--- a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+@@ -22,7 +22,7 @@
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::sync::oneshot;
+ 
+-pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.6";
++pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.7";
+ const MAX_PENDING: usize = 16;
+ const POSITION_TOLERANCE: u16 = 8;
+ const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);

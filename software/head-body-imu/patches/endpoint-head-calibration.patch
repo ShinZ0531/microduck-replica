@@ -1,0 +1,404 @@
+diff --git a/microduck-hd1910/firmware/duck-control/src/head_calibration.rs b/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
+--- a/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
++++ b/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
+@@ -8,7 +8,7 @@
+ use crate::trunk_imu::{HostImuSample, TrunkImuKind};
+ use serde_json::{Value, json};
+ 
+-pub const CONTRACT: &str = "head_mount_standing_v2";
++pub const CONTRACT: &str = "head_mount_endpoints_v3";
+ 
+ /// 与独立校准 ABI 一致；现有估计 ABI v1 不改布局。
+ #[repr(C)]
+@@ -30,6 +30,7 @@
+ type Create = unsafe extern "C" fn() -> *mut c_void;
+ type Destroy = unsafe extern "C" fn(*mut c_void);
+ type Observe = unsafe extern "C" fn(*mut c_void, *const HeadInput, *const EncoderPair) -> i32;
++type ResetMotion = unsafe extern "C" fn(*mut c_void) -> i32;
+ type Capture = unsafe extern "C" fn(*mut c_void, u32, u32, *mut Status) -> i32;
+ 
+ /// 绑定实际头部零位、方向及冻结模型；标志和 motion_enabled 不作为安装几何的一部分。
+@@ -54,6 +55,7 @@
+     destroy: Destroy,
+     observe: Observe,
+     capture: Capture,
++    reset_motion: ResetMotion,
+     binding: Value,
+     epoch: Option<u32>,
+     sequence: Option<u32>,
+@@ -90,6 +92,11 @@
+                 .get::<Capture>(b"microduck_head_calibration_capture\0")
+                 .map_err(|error| error.to_string())?
+         };
++        let reset_motion = unsafe {
++            *library
++                .get::<ResetMotion>(b"microduck_head_calibration_reset_motion\0")
++                .map_err(|error| error.to_string())?
++        };
+         let handle = unsafe { create() };
+         if handle.is_null() {
+             return Err("无法创建头部安装核验会话".into());
+@@ -100,6 +107,7 @@
+             destroy,
+             observe,
+             capture,
++            reset_motion,
+             binding: binding(calibration),
+             epoch: None,
+             sequence: None,
+@@ -152,6 +160,15 @@
+         Ok(())
+     }
+ 
++    /// 开始一次独立头部往返前丢弃暂停和旧轨迹样本，不丢失已通过步骤。
++    pub fn reset_motion(&mut self) -> Result<(), String> {
++        self.require_fresh()?;
++        if unsafe { (self.reset_motion)(self.handle) } != 0 {
++            return Err("无法开始当前关节的独立端点采集".into());
++        }
++        Ok(())
++    }
++
+     /// 查询或采集下一步骤；失败保留当前步骤，成功结果包含实测误差与采样数量。
+     pub fn capture(&mut self, step: u32, capture: bool) -> Result<Value, String> {
+         if capture
+@@ -170,7 +187,10 @@
+         }
+         let row = json!({"step":step,"sample_count":status.count,"sample_span_s":status.span,
+             "max_body_error_deg":status.error_deg,"body_gyro_rms_rad_s":status.gyro_rms,
+-            "body_gyro_peak_rad_s":status.gyro_peak,"head_span_deg":status.head_span,"gyro_relative_error_ratio":status.gyro_ratio});
++            "body_gyro_peak_rad_s":status.gyro_peak,"head_span_deg":status.head_span,"gyro_integral_error_ratio":status.gyro_ratio,
++            "method":if step>=6 {"settled_endpoints_segment_integral_v1"} else {"body_static_v1"},
++            "endpoint_count":if step>=6 {4} else {0},"segment_count":if step>=6 {3} else {0},
++            "rate_quality":"diagnostic_only"});
+         if result != 0 {
+             let bytes: Vec<_> = status
+                 .reason
+@@ -179,13 +199,14 @@
+                 .map(|value| *value as u8)
+                 .collect();
+             return Err(format!(
+-                "{}（{} 帧，躯干残差 {:.2}°，角速度 RMS {:.3}、峰值 {:.3} rad/s，关节行程 {:.1}°）",
++                "{}（{} 帧，端点姿态差 {}°，瞬时角速度 RMS {}、峰值 {} rad/s，实测行程 {}°，单段积分相对误差 {}）",
+                 String::from_utf8_lossy(&bytes),
+                 status.count,
+-                status.error_deg,
+-                status.gyro_rms,
+-                status.gyro_peak,
+-                status.head_span
++                measured_text(status.error_deg),
++                measured_text(status.gyro_rms),
++                measured_text(status.gyro_peak),
++                measured_text(status.head_span),
++                measured_text(status.gyro_ratio)
+             ));
+         }
+         if capture {
+@@ -204,6 +225,15 @@
+     /// 在 Library 卸载之前释放 C++ 状态；无后台任务或设备副作用。
+     fn drop(&mut self) {
+         unsafe { (self.destroy)(self.handle) };
++    }
++}
++
++/// 未执行的测量必须显示“未测”，不能把 ABI 的 NaN 或默认零误报为实测。
++fn measured_text(value: f64) -> String {
++    if value.is_finite() {
++        format!("{value:.3}")
++    } else {
++        "未测".into()
+     }
+ }
+ 
+@@ -228,11 +258,15 @@
+         && number("sample_span_s").is_some_and(|span| span >= 1.5);
+     if (6..=9).contains(&index) {
+         basic
+-            && number("max_body_error_deg").is_some_and(|value| (0.0..=5.0).contains(&value))
+-            && number("body_gyro_rms_rad_s").is_some_and(|value| (0.0..=0.15).contains(&value))
+-            && number("body_gyro_peak_rad_s").is_some_and(|value| (0.0..=0.5).contains(&value))
+-            && number("gyro_relative_error_ratio").is_some_and(|value| (0.0..=0.5).contains(&value))
++            && number("max_body_error_deg").is_some_and(|value| (0.0..=3.0).contains(&value))
++            && number("body_gyro_rms_rad_s").is_some_and(|value| value >= 0.0)
++            && number("body_gyro_peak_rad_s").is_some_and(|value| value >= 0.0)
++            && number("gyro_integral_error_ratio").is_some_and(|value| (0.0..=0.5).contains(&value))
+             && number("head_span_deg").is_some_and(|value| (8.0..=360.0).contains(&value))
++            && report["method"] == "settled_endpoints_segment_integral_v1"
++            && report["endpoint_count"] == 4
++            && report["segment_count"] == 3
++            && report["rate_quality"] == "diagnostic_only"
+     } else {
+         basic
+     }
+@@ -300,7 +334,9 @@
+             .map(|step| {
+                 json!({"step":step,"sample_count":100,
+             "sample_span_s":1.98,"max_body_error_deg":0.1,"body_gyro_rms_rad_s":0.01,"body_gyro_peak_rad_s":0.02,
+-            "head_span_deg":10.0,"gyro_relative_error_ratio":0.1})
++            "head_span_deg":10.0,"gyro_integral_error_ratio":0.1,
++            "method":"settled_endpoints_segment_integral_v1","endpoint_count":4,"segment_count":3,
++            "rate_quality":"diagnostic_only"})
+             })
+             .collect();
+         let proof = json!({"contract":CONTRACT,"source":"head_bmi088",
+diff --git a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+--- a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+@@ -22,7 +22,7 @@
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::sync::oneshot;
+ 
+-pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.4";
++pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.5";
+ const MAX_PENDING: usize = 16;
+ const POSITION_TOLERANCE: u16 = 8;
+ const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
+diff --git a/microduck-hd1910/firmware/robotd/src/head_imu_standing.rs b/microduck-hd1910/firmware/robotd/src/head_imu_standing.rs
+--- a/microduck-hd1910/firmware/robotd/src/head_imu_standing.rs
++++ b/microduck-hd1910/firmware/robotd/src/head_imu_standing.rs
+@@ -5,10 +5,12 @@
+ const STEP_TIMEOUT: Duration = Duration::from_secs(60);
+ const PREPARE_TIME: Duration = Duration::from_secs(3);
+ const CAPTURE_INTERVAL: Duration = Duration::from_millis(200);
+-const SWEEP_TIME: Duration = Duration::from_secs(8);
++const MOVE_TIME: Duration = Duration::from_secs(2);
++const SETTLE_TIME: Duration = Duration::from_secs(1);
++const SETTLE_TIMEOUT: Duration = Duration::from_secs(6);
+ const SWEEP_COUNTS: i32 = 57; // 4096 count/rev，约 ±5°；不使用网页传入的幅度。
+ 
+-/// 有界单关节轨迹，中心来自已稳定的站姿目标；不改其他十四颗目标。
++/// 单关节依次回中位、正向、反向、回中位；每段结束需真实反馈停稳才进入下一段。
+ #[derive(Clone)]
+ struct Sweep {
+     index: usize,
+@@ -16,28 +18,63 @@
+     from: i32,
+     center: i32,
+     started: Instant,
++    point: usize,
++    settling: Option<Instant>,
++    settled_since: Option<Instant>,
++    settled_min: i32,
++    settled_max: i32,
+ }
+ 
+ impl Sweep {
+-    /// 连续经过 +5°、-5°、中心；每段线性慢速，最后一段回中心。
++    /// 目标始终限定在原站姿中心 ±5°；第 0 点先恢复中位，防止重试复用暂停姿态。
++    fn endpoint(&self) -> i32 {
++        match self.point {
++            1 => self.center + SWEEP_COUNTS,
++            2 => self.center - SWEEP_COUNTS,
++            _ => self.center,
++        }
++    }
++
++    /// 两侧间运动 4 秒，其余 2 秒；三次曲线起停速度为零，仍允许实际舵机卡顿。
+     fn target(&self, now: Instant) -> i32 {
+-        let seconds = now.saturating_duration_since(self.started).as_secs_f64();
+-        let (from, to, fraction) = if seconds < 2.0 {
+-            (self.from, self.center + SWEEP_COUNTS, seconds / 2.0)
+-        } else if seconds < 6.0 {
+-            (
+-                self.center + SWEEP_COUNTS,
+-                self.center - SWEEP_COUNTS,
+-                (seconds - 2.0) / 4.0,
+-            )
++        let duration = if self.point == 2 {
++            MOVE_TIME * 2
+         } else {
+-            (
+-                self.center - SWEEP_COUNTS,
+-                self.center,
+-                ((seconds - 6.0) / 2.0).min(1.0),
+-            )
++            MOVE_TIME
+         };
+-        (f64::from(from) + f64::from(to - from) * fraction).round() as i32
++        let fraction = (now.saturating_duration_since(self.started).as_secs_f64()
++            / duration.as_secs_f64())
++        .clamp(0.0, 1.0);
++        let eased = fraction * fraction * (3.0 - 2.0 * fraction);
++        (f64::from(self.from) + f64::from(self.endpoint() - self.from) * eased).round() as i32
++    }
++
++    /// 在当前目标旁反馈连续一秒内变化不超过 4 count，才算端点停稳；超时交给调度器停止。
++    fn settled(&mut self, now: Instant, measured: i32) -> bool {
++        if (measured - self.endpoint()).abs() > 6 {
++            self.settled_since = None;
++            return false;
++        }
++        let minimum = self.settled_min.min(measured);
++        let maximum = self.settled_max.max(measured);
++        if self.settled_since.is_none() || maximum - minimum > 4 {
++            self.settled_since = Some(now);
++            self.settled_min = measured;
++            self.settled_max = measured;
++            return false;
++        }
++        self.settled_min = minimum;
++        self.settled_max = maximum;
++        now.saturating_duration_since(self.settled_since.unwrap()) >= SETTLE_TIME
++    }
++
++    /// 一个端点已停稳，才开始下一单向段；不改变其他关节的 Hold 目标。
++    fn advance(&mut self, now: Instant) {
++        self.from = self.endpoint();
++        self.point += 1;
++        self.started = now;
++        self.settling = None;
++        self.settled_since = None;
+     }
+ }
+ 
+@@ -129,6 +166,10 @@
+                 .as_secs_f64()
+                 .ceil()
+         );
++        status["test_point"] = self
++            .sweep
++            .as_ref()
++            .map_or(Value::Null, |sweep| json!(sweep.point));
+         status["test_joint"] = self
+             .sweep
+             .as_ref()
+@@ -220,13 +261,20 @@
+                     from: i32::from(sample.feedback.position_raw),
+                     center: self.centers[index],
+                     started: now,
++                    point: 0,
++                    settling: None,
++                    settled_since: None,
++                    settled_min: 0,
++                    settled_max: 0,
+                 });
+             }
+-            let sweep = self.sweep.as_ref().unwrap();
+-            if (i32::from(samples[&sweep.id].feedback.position_raw) - hold.targets[sweep.index])
+-                .abs()
+-                > 34
+-            {
++            let sweep = self.sweep.as_mut().unwrap();
++            let Some(sample) = samples.get(&sweep.id) else {
++                self.pause(Some(hold), samples, "缺少当前测试关节反馈，测试停止");
++                return;
++            };
++            let measured = i32::from(sample.feedback.position_raw);
++            if (measured - hold.targets[sweep.index]).abs() > 34 {
+                 self.pause(
+                     Some(hold),
+                     samples,
+@@ -235,8 +283,44 @@
+                 return;
+             }
+             hold.targets[sweep.index] = sweep.target(now);
+-            self.message = format!("自动测试 ID{}，请保持机身站稳；不要手动掰头部", sweep.id);
+-            if now.saturating_duration_since(sweep.started) < SWEEP_TIME {
++            let duration = if sweep.point == 2 {
++                MOVE_TIME * 2
++            } else {
++                MOVE_TIME
++            };
++            if now.saturating_duration_since(sweep.started) < duration {
++                self.message = format!(
++                    "ID{} 前往端点 {} / 3，途中允许卡顿，请保持机身站稳",
++                    sweep.id, sweep.point
++                );
++                return;
++            }
++            if sweep.settling.is_none() {
++                sweep.settling = Some(now);
++                if sweep.point == 0 {
++                    // 回中位完成后才开启完整记录；重试时旧轨迹不能混入端点和积分证据。
++                    if let Err(error) = self.core.reset_motion() {
++                        self.pause(Some(hold), samples, &error);
++                        return;
++                    }
++                }
++            }
++            self.message = format!(
++                "ID{} 等待端点 {} / 3 停稳，自动采集姿态",
++                sweep.id, sweep.point
++            );
++            if !sweep.settled(now, measured) {
++                if now.saturating_duration_since(sweep.settling.unwrap()) > SETTLE_TIMEOUT {
++                    self.pause(
++                        Some(hold),
++                        samples,
++                        "端点未停稳，已停止；调整后重试当前关节",
++                    );
++                }
++                return;
++            }
++            if sweep.point < 3 {
++                sweep.advance(now);
+                 return;
+             }
+         }
+@@ -281,30 +365,39 @@
+ mod tests {
+     use super::*;
+ 
+-    /// 确认自动轨迹连续、有界、按时回中心；只比较原始 count，不创建串口。
++    /// 正反向都在 ±5° 内；未停稳不能推进，平台停顿不会被当成持续匀速运动。
+     #[test]
+-    fn sweep_is_slow_bounded_and_returns_to_standing_center() {
++    fn sweep_waits_for_feedback_at_each_endpoint() {
+         let start = Instant::now();
+-        let sweep = Sweep {
++        let mut sweep = Sweep {
+             index: 0,
+             id: 30,
+             from: 2048,
+             center: 2048,
+             started: start,
++            point: 0,
++            settling: None,
++            settled_since: None,
++            settled_min: 0,
++            settled_max: 0,
+         };
++        sweep.advance(start);
+         assert_eq!(sweep.target(start), 2048);
+-        assert_eq!(sweep.target(start + Duration::from_secs(2)), 2105);
+-        assert_eq!(sweep.target(start + Duration::from_secs(6)), 1991);
+-        assert_eq!(sweep.target(start + SWEEP_TIME), 2048);
+-        let targets: Vec<_> = (0..=400)
+-            .map(|tick| sweep.target(start + Duration::from_millis(tick * 20)))
+-            .collect();
+-        assert!(targets.iter().all(|target| (1991..=2105).contains(target)));
+-        assert!(
+-            targets
+-                .windows(2)
+-                .all(|pair| (pair[1] - pair[0]).abs() <= 1)
+-        );
++        assert_eq!(sweep.target(start + MOVE_TIME), 2105);
++        assert!(!sweep.settled(start, 2105));
++        assert!(!sweep.settled(start + SETTLE_TIME, 2090));
++        assert!(!sweep.settled(start + SETTLE_TIME * 2, 2105));
++        assert!(sweep.settled(start + SETTLE_TIME * 3, 2105));
++        sweep.advance(start + SETTLE_TIME * 3);
++        assert_eq!(sweep.target(sweep.started + MOVE_TIME * 2), 1991);
++        for tick in 0..=200 {
++            assert!(
++                (1991..=2105)
++                    .contains(&sweep.target(sweep.started + Duration::from_millis(tick * 20)))
++            );
++        }
++        sweep.advance(start + Duration::from_secs(10));
++        assert_eq!(sweep.target(sweep.started + MOVE_TIME), 2048);
+     }
+     /// 使用真实 C ABI 空会话和模拟关节反馈验证停止/失联行为，不创建 Bus 或串口。
+     #[test]
+@@ -344,6 +437,11 @@
+                 from: 2048,
+                 center: 2048,
+                 started: Instant::now(),
++                point: 1,
++                settling: None,
++                settled_since: None,
++                settled_min: 0,
++                settled_max: 0,
+             });
+             hold.targets[index] = 2070;
+             if expired {

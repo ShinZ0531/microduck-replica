@@ -1,4 +1,5 @@
 #include "head_calibration.h"
+#include "head_endpoint_verification.h"
 
 #include <algorithm>
 #include <array>
@@ -6,6 +7,7 @@
 #include <cstdio>
 #include <deque>
 #include <new>
+#include <limits>
 #include <stdexcept>
 
 static_assert(sizeof(MicroduckHeadCalibrationStatus) == 352, "Unexpected calibration ABI layout");
@@ -16,16 +18,12 @@ namespace
     using Rotation = std::array<double, 4>;
     constexpr double kDegrees = 57.29577951308232;
     constexpr unsigned long long kStaticWindowNs = 2000000000;
-    constexpr unsigned long long kMotionWindowNs = 6000000000;
+    constexpr unsigned long long kMotionWindowNs = 40000000000;
     constexpr unsigned long long kMaximumGapNs = 100000000;
     constexpr unsigned int kMinimumSamples = 60;
     constexpr double kStaticSpreadDeg = 1.5;
     constexpr double kStaticHeadDeg = 2.0;
-    constexpr double kMinimumHeadSpanDeg = 8.0;
-    constexpr double kMaximumBodyErrorDeg = 5.0;
     constexpr double kStaticGyroRadS = 0.08;
-    constexpr double kMotionGyroRmsRadS = 0.15;
-    constexpr double kMotionGyroPeakRadS = 0.5;
 
     /** 单个已对齐的有效传感器及编码器帧；时间为 IMU 源时间 ns。 */
     struct Frame
@@ -278,57 +276,45 @@ namespace
         return estimate;
     }
 
-    /** 核验固定躯干时的头部独立运动及角速度消除，或整机倾斜的坐标方向。 */
+    /** 头部使用独立停稳端点与单向积分；整机倾斜仍按原有静态坐标方向复核。 */
     void verify(Session& session, const std::deque<Frame>& frames, MicroduckHeadCalibrationStatus& status)
     {
+        if (session.nextStep >= 6)
+        {
+            std::deque<MicroduckHeadInput> aligned;
+            for (const Frame& frame : frames)
+            {
+                aligned.push_back(frame.aligned);
+            }
+            status.nextStep = session.nextStep;
+            microduck::verifyHeadEndpoints(aligned, session.mount, status);
+            return;
+        }
         std::array<double, 4> minimum;
         std::array<double, 4> maximum;
-        std::copy(std::begin(frames.front().aligned.jointAnglesRad),
-                  std::end(frames.front().aligned.jointAnglesRad),
-                  minimum.begin());
+        std::copy_n(frames.front().aligned.jointAnglesRad, 4, minimum.begin());
         maximum = minimum;
         double gyroSquared = 0.0;
-        double gyroPeak = 0.0;
+        status.maxBodyErrorDeg = 0.0;
+        status.bodyGyroPeakRadS = 0.0;
         Vector gravitySum{};
-        Vector residualSum{};
-        Vector relativeSum{};
-        unsigned int groupCount = 0;
-        unsigned int groups = 0;
-        double residualEnergy = 0.0;
-        double relativeEnergy = 0.0;
-        const bool moving = session.nextStep >= 6 && session.nextStep <= 9;
-        const MicroduckBodyEstimate first = body(session, frames.front());
-        const Rotation firstRotation{
-            first.bodyToWorldWxyz[0], first.bodyToWorldWxyz[1], first.bodyToWorldWxyz[2], first.bodyToWorldWxyz[3]};
-        // 六轴 IMU 没有绝对航向：只判本窗口的躯干旋转变化，不把步骤间的航向漂移当安装变化。
+        const auto first = body(session, frames.front());
+        const Rotation firstRotation{first.bodyToWorldWxyz[0], first.bodyToWorldWxyz[1],
+                                     first.bodyToWorldWxyz[2], first.bodyToWorldWxyz[3]};
         for (const Frame& frame : frames)
         {
             const auto estimate = body(session, frame);
-            const Rotation rotation{estimate.bodyToWorldWxyz[0],
-                                    estimate.bodyToWorldWxyz[1],
-                                    estimate.bodyToWorldWxyz[2],
-                                    estimate.bodyToWorldWxyz[3]};
+            const Rotation rotation{estimate.bodyToWorldWxyz[0], estimate.bodyToWorldWxyz[1],
+                                    estimate.bodyToWorldWxyz[2], estimate.bodyToWorldWxyz[3]};
             status.maxBodyErrorDeg = std::max(status.maxBodyErrorDeg, rotationError(rotation, firstRotation));
             double squared = 0.0;
             for (int axis = 0; axis < 3; ++axis)
             {
                 squared += estimate.bodyGyroRadS[axis] * estimate.bodyGyroRadS[axis];
                 gravitySum[axis] += estimate.gravityInBody[axis];
-                residualSum[axis] += estimate.bodyGyroRadS[axis];
-                relativeSum[axis] += estimate.headRelativeGyroInBodyRadS[axis];
-            }
-            // 约 0.2 秒均值降低 count 差分噪声；相对能量检查可识别小幅运动中陀螺全零或方向错误。
-            if (++groupCount == 10)
-            {
-                residualEnergy += dot(residualSum, residualSum) / 100.0;
-                relativeEnergy += dot(relativeSum, relativeSum) / 100.0;
-                residualSum = {};
-                relativeSum = {};
-                groupCount = 0;
-                ++groups;
             }
             gyroSquared += squared;
-            gyroPeak = std::max(gyroPeak, std::sqrt(squared));
+            status.bodyGyroPeakRadS = std::max(status.bodyGyroPeakRadS, std::sqrt(squared));
             for (int joint = 0; joint < 4; ++joint)
             {
                 minimum[joint] = std::min(minimum[joint], frame.aligned.jointAnglesRad[joint]);
@@ -336,39 +322,7 @@ namespace
             }
         }
         status.bodyGyroRmsRadS = std::sqrt(gyroSquared / frames.size());
-        status.bodyGyroPeakRadS = gyroPeak;
         const Vector meanGravity = unit(gravitySum);
-        if (moving)
-        {
-            if (groups == 0 || relativeEnergy / groups < 0.0001)
-            {
-                throw std::runtime_error("头部测试角速度激励不足，不能证明角速度补偿有效");
-            }
-            status.gyroRelativeErrorRatio = std::sqrt(residualEnergy / relativeEnergy);
-            if (status.gyroRelativeErrorRatio > 0.5)
-            {
-                throw std::runtime_error("头部角速度相对残差超过 50%，请检查 IMU 陀螺、方向及机身是否晃动");
-            }
-            const int active = static_cast<int>(session.nextStep) - 6;
-            status.headSpanDeg = (maximum[active] - minimum[active]) * kDegrees;
-            if (status.headSpanDeg < kMinimumHeadSpanDeg)
-            {
-                throw std::runtime_error("自动测试关节的实测行程不足 8 度，请检查目标跟随和机械干涉");
-            }
-            for (int joint = 0; joint < 4; ++joint)
-            {
-                if (joint != active && (maximum[joint] - minimum[joint]) * kDegrees > 3.0)
-                {
-                    throw std::runtime_error("一次只检查一个关节，其他头颈关节变化须不超过 3 度");
-                }
-            }
-            if (status.maxBodyErrorDeg > kMaximumBodyErrorDeg || status.bodyGyroRmsRadS > kMotionGyroRmsRadS ||
-                gyroPeak > kMotionGyroPeakRadS)
-            {
-                throw std::runtime_error("固定躯干补偿误差过大：请核对躯干固定、关节方向、安装及头部振动，不能保存");
-            }
-            return;
-        }
         for (int joint = 0; joint < 4; ++joint)
         {
             if ((maximum[joint] - minimum[joint]) * kDegrees > kStaticHeadDeg)
@@ -532,7 +486,7 @@ int microduck_head_calibration_observe(void* handle,
             session.frames.clear();
         }
         session.frames.push_back({aligned});
-        while (session.frames.size() > 350 ||
+        while (session.frames.size() > 2200 ||
                session.lastNs - session.frames.front().aligned.imuSampleNs > kMotionWindowNs)
         {
             session.frames.pop_front();
@@ -558,6 +512,12 @@ int microduck_head_calibration_capture(void* handle,
     }
     *status = {};
     status->abiVersion = 2;
+    const double unknown = std::numeric_limits<double>::quiet_NaN();
+    status->maxBodyErrorDeg = unknown;
+    status->bodyGyroRmsRadS = unknown;
+    status->bodyGyroPeakRadS = unknown;
+    status->headSpanDeg = unknown;
+    status->gyroRelativeErrorRatio = unknown;
     Session& session = *static_cast<Session*>(handle);
     int result = MICRODUCK_ESTIMATE_OK;
     try
@@ -593,3 +553,39 @@ int microduck_head_calibration_capture(void* handle,
     std::copy(session.mount.begin(), session.mount.end(), status->mountWxyz);
     return result;
 }
+
+/** 重试头部测试时仅清空当前运动证据，保留已通过的整机安装及先前关节结果。 */
+int microduck_head_calibration_reset_motion(void* handle)
+{
+    if (handle == nullptr)
+    {
+        return MICRODUCK_ESTIMATE_INVALID;
+    }
+    Session& session = *static_cast<Session*>(handle);
+    if (session.nextStep < 6 || session.nextStep > 9)
+    {
+        return MICRODUCK_ESTIMATE_INVALID;
+    }
+    session.frames.clear();
+    return MICRODUCK_ESTIMATE_OK;
+}
+
+/** 仅在步骤 8（ID32 偏航）跳过自动测试；不清空安装结果，也不冒充已测量。 */
+int microduck_head_calibration_skip_yaw(void* handle)
+{
+    if (handle == nullptr)
+    {
+        return MICRODUCK_ESTIMATE_INVALID;
+    }
+    Session& session = *static_cast<Session*>(handle);
+    if (session.nextStep != 8)
+    {
+        return MICRODUCK_ESTIMATE_INVALID;
+    }
+    session.nextStep = 9;
+    session.needsLevel = false;
+    session.levelSamples = 0;
+    session.frames.clear();
+    return MICRODUCK_ESTIMATE_OK;
+}
+

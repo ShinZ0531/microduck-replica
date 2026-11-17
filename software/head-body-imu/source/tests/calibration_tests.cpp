@@ -42,16 +42,62 @@ namespace
         return value;
     }
 
+    /** 12 秒端点协议的离散实际位置；可模拟每 240 ms 才跳一次的舵机卡顿。 */
+    int rawAt(int sample, int joint, int active, bool jerky)
+    {
+        double seconds = std::max(0, sample) * 0.02;
+        if (jerky)
+        {
+            seconds = std::floor(seconds / 0.24) * 0.24;
+        }
+        double offset = 0.0;
+        if (joint == active)
+        {
+            if (seconds < 1.0)
+            {
+                offset = 0.0;
+            }
+            else if (seconds < 3.0)
+            {
+                offset = (seconds - 1.0) / 2.0;
+            }
+            else if (seconds < 4.0)
+            {
+                offset = 1.0;
+            }
+            else if (seconds < 8.0)
+            {
+                offset = 1.0 - (seconds - 4.0) / 2.0;
+            }
+            else if (seconds < 9.0)
+            {
+                offset = -1.0;
+            }
+            else if (seconds < 11.0)
+            {
+                offset = -1.0 + (seconds - 9.0) / 2.0;
+            }
+        }
+        const double initial = joint < 2 ? 0.25 : 0.0;
+        return 2048 + static_cast<int>(std::round((initial + 0.09 * offset) / kCountRad));
+    }
+
     /** 生成计数离散后的真实关节、IMU 及陀螺数据，源时刻位于两帧中间。 */
     void feed(void* handle,
               unsigned long long& timeNs,
               Rotation body,
               int active = -1,
               bool wrongDirection = false,
-              bool wrongGyro = false)
+              bool wrongGyro = false,
+              bool jerky = false,
+              int fault = 0)
     {
-        for (int sample = 0; sample < 130; ++sample)
+        for (int sample = 0; sample < (active >= 0 ? (fault == 1 ? 530 : 600) : 130); ++sample)
         {
+            if (fault == 2 && sample == 250)
+            {
+                timeNs += 80000000; // 100 ms 的源间隔：不能用跨缺口积分证明转角。
+            }
             MicroduckEncoderPair pair{};
             pair.previousNs = timeNs;
             pair.currentNs = timeNs + 20000000;
@@ -64,22 +110,37 @@ namespace
             double velocity[4];
             for (int joint = 0; joint < 4; ++joint)
             {
-                const double initial = joint < 2 ? 0.25 : 0.0;
-                const double amplitude = joint == active ? 0.09 : 0.0;
-                const double previous = initial + amplitude * std::sin(sample * 0.04);
-                const double current = initial + amplitude * std::sin((sample + 1) * 0.04);
                 pair.zeroRaw[joint] = 2048;
                 pair.direction[joint] = 1;
-                pair.previousRaw[joint] = 2048 + static_cast<int>(std::round(previous / kCountRad));
-                pair.currentRaw[joint] = 2048 + static_cast<int>(std::round(current / kCountRad));
+                pair.previousRaw[joint] = rawAt(sample, joint, active, jerky);
+                pair.currentRaw[joint] = rawAt(sample + 1, joint, active, jerky);
                 angles[joint] = ((pair.previousRaw[joint] + pair.currentRaw[joint]) * 0.5 - 2048) * kCountRad;
-                velocity[joint] = (pair.currentRaw[joint] - pair.previousRaw[joint]) * kCountRad / 0.02;
+                // 卡顿用例给陀螺一帧相位差：瞬时差分残差大，但完整单向积分仍对应同一段转动。
+                velocity[joint] = jerky
+                    ? (rawAt(sample, joint, active, true) - rawAt(sample - 1, joint, active, true)) * kCountRad / 0.02
+                    : (pair.currentRaw[joint] - pair.previousRaw[joint]) * kCountRad / 0.02;
             }
             Rotation sensorToBody{};
             double relative[3];
             require(microduck_head_kinematics(angles, velocity, kMount.data(), sensorToBody.data(), relative) == 0,
                     "synthetic FK");
-            const Rotation sensorToWorld = multiply(body, sensorToBody);
+            Rotation sensorToWorld = multiply(body, sensorToBody);
+            if (fault == 3)
+            {
+                const double initial[4] = {rawAt(0, 0, -1, false) - 2048.0,
+                                           rawAt(0, 1, -1, false) - 2048.0, 0.0, 0.0};
+                double anglesAtStart[4];
+                for (int joint = 0; joint < 4; ++joint)
+                {
+                    anglesAtStart[joint] = initial[joint] * kCountRad;
+                }
+                Rotation frozen{};
+                const double still[4] = {};
+                double unused[3];
+                require(microduck_head_kinematics(anglesAtStart, still, kMount.data(), frozen.data(), unused) == 0,
+                        "frozen sensor fixture");
+                sensorToWorld = multiply(body, frozen);
+            }
             std::copy(sensorToWorld.begin(), sensorToWorld.end(), input.sensorToWorldWxyz);
             const Rotation inverse{sensorToBody[0], -sensorToBody[1], -sensorToBody[2], -sensorToBody[3]};
             const Rotation spin =
@@ -87,6 +148,10 @@ namespace
             for (int axis = 0; axis < 3; ++axis)
             {
                 input.sensorGyroRadS[axis] = wrongGyro ? 0.0 : spin[axis + 1];
+                if (fault == 4)
+                {
+                    input.sensorGyroRadS[axis] *= -1.0;
+                }
             }
             if (wrongDirection && active >= 0)
             {
@@ -125,7 +190,7 @@ namespace
     }
 
     /** 十步成功仍只返回核验结果；没有任何电机或文件接口。 */
-    void completeCalibration()
+    void completeCalibration(bool jerky)
     {
         void* handle = microduck_head_calibration_create();
         require(handle != nullptr, "create session");
@@ -135,7 +200,8 @@ namespace
         for (unsigned int step = 6; step < 10; ++step)
         {
             const auto pose = tilted(2, 30.0);
-            feed(handle, timeNs, pose, static_cast<int>(step) - 6);
+            require(microduck_head_calibration_reset_motion(handle) == 0, "fresh independent head trace");
+            feed(handle, timeNs, pose, static_cast<int>(step) - 6, false, false, jerky);
             const int code = microduck_head_calibration_capture(handle, step, 1, &status);
             if (code != 0)
             {
@@ -147,6 +213,13 @@ namespace
                              status.bodyGyroRmsRadS);
             }
             require(code == 0, "complete physical protocol simulation");
+            require(status.headSpanDeg >= 8.0, "reports real travel before diagnostics");
+            require(status.maxBodyErrorDeg < 0.1, "settled endpoints ignore intermediate speed mismatch");
+            require(status.gyroRelativeErrorRatio < 0.25, "all single-direction integrals agree");
+            if (jerky)
+            {
+                require(status.bodyGyroRmsRadS > 0.15, "stutter regression would fail old instantaneous gate");
+            }
         }
         require(status.nextStep == 10 && status.mountAvailable == 1, "ten steps complete");
         double product = 0.0;
@@ -159,9 +232,36 @@ namespace
         microduck_head_calibration_destroy(handle);
     }
 
-    /** 缺少运动、反向关节以及漏减角速度均不得推进核验。 */
-    void rejectInvalidEvidence()
+    /** 偏航只在步骤 8 可跳过：推进到下一步但不产生测量或端点证据。 */
+    void skipYawOnlyAtItsOwnStep()
     {
+        void* handle = microduck_head_calibration_create();
+        require(handle != nullptr, "create session for skip");
+        unsigned long long timeNs = 1000000000;
+        prepare(handle, timeNs);
+        MicroduckHeadCalibrationStatus status{};
+        require(microduck_head_calibration_skip_yaw(handle) != 0, "cannot skip before yaw");
+        for (unsigned int step = 6; step <= 7; ++step)
+        {
+            feed(handle, timeNs, tilted(2, 30.0), static_cast<int>(step) - 6);
+            require(microduck_head_calibration_capture(handle, step, 1, &status) == 0,
+                    "joints before yaw keep their measured evidence");
+            require(status.nextStep == step + 1, "advance exactly one joint");
+        }
+        require(microduck_head_calibration_skip_yaw(handle) == 0, "skip yaw at its own step");
+        require(microduck_head_calibration_capture(handle, 0, 0, &status) == 0, "query after skip");
+        require(status.nextStep == 9, "skip advances to the roll joint");
+        require(std::isnan(status.headSpanDeg), "skipped yaw has no measured travel");
+        require(microduck_head_calibration_skip_yaw(handle) != 0, "cannot skip twice");
+        require(microduck_head_calibration_reset_motion(handle) == 0, "start the roll trace");
+        feed(handle, timeNs, tilted(2, 30.0), 3);
+        require(microduck_head_calibration_capture(handle, 9, 1, &status) == 0, "roll still needs real evidence");
+        require(status.nextStep == 10, "ten steps complete with yaw skipped");
+        microduck_head_calibration_destroy(handle);
+    }
+
+    /** 缺少运动、反向关节以及漏减角速度均不得推进核验。 */
+    void rejectInvalidEvidence()    {
         for (int fault = 0; fault < 12; ++fault)
         {
             void* handle = microduck_head_calibration_create();
@@ -184,6 +284,30 @@ namespace
             microduck_head_calibration_destroy(handle);
         }
     }
+    /** 缺端点、漏采、姿态冻结及陀螺反向不得通过；重试清空当前证据后可继续原进度。 */
+    void rejectIncompleteTracesAndRetry()
+    {
+        for (int fault = 1; fault <= 4; ++fault)
+        {
+            void* handle = microduck_head_calibration_create();
+            unsigned long long timeNs = 1000000000;
+            prepare(handle, timeNs);
+            MicroduckHeadCalibrationStatus status{};
+            require(microduck_head_calibration_capture(handle, 0, 0, &status) == 0, "query current progress");
+            require(std::isnan(status.headSpanDeg), "unmeasured travel is unknown, not zero");
+            require(microduck_head_calibration_reset_motion(handle) == 0, "start independent trace");
+            feed(handle, timeNs, {1.0, 0.0, 0.0, 0.0}, 0, false, false, true, fault);
+            require(microduck_head_calibration_capture(handle, 6, 1, &status) != 0, "bad trace rejected");
+            require(status.nextStep == 6, "bad trace cannot advance");
+            require(microduck_head_calibration_reset_motion(handle) == 0, "retry drops old failed trace");
+            require(microduck_head_calibration_capture(handle, 6, 1, &status) != 0, "reset cannot certify empty trace");
+            feed(handle, timeNs, {1.0, 0.0, 0.0, 0.0}, 0, false, false, true);
+            require(microduck_head_calibration_capture(handle, 6, 1, &status) == 0, "retry passes with complete evidence");
+            require(status.nextStep == 7, "retry preserves mounting and advances exactly one joint");
+            microduck_head_calibration_destroy(handle);
+        }
+    }
+
     /** 没有回正、前后重复或左右反向不能被自动采集当成正确步骤。 */
     void rejectTiltLabelsAndMissingReturn()
     {
@@ -215,8 +339,11 @@ namespace
 /** 执行完整模拟流程及可导致假通过的故障回归。 */
 int main()
 {
-    completeCalibration();
+    completeCalibration(false);
+    completeCalibration(true);
+    skipYawOnlyAtItsOwnStep();
     rejectInvalidEvidence();
     rejectTiltLabelsAndMissingReturn();
+    rejectIncompleteTracesAndRetry();
     std::printf("%u calibration assertions passed\n", assertions);
 }

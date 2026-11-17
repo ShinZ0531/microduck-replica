@@ -25,9 +25,33 @@
         "tracked_modified_files": 5,
         "new_files": 1,
         "purpose": "powered standing collection, automatic bounded head tests, stop/lease handling; API45 and calibration ABI v2"
+      },
+      {
+        "path": "patches/endpoint-head-calibration.patch",
+        "tracked_modified_files": 3,
+        "new_files": 0,
+        "purpose": "four settled endpoints and three complete gyro-integral segments; stutter-tolerant standing calibration; proof contract v3, unchanged calibration ABI v2"
+      },
+      {
+        "path": "patches/skip-yaw.patch",
+        "tracked_modified_files": 3,
+        "new_files": 0,
+        "purpose": "operator-requested yaw (ID32) skip: explicit zero-evidence report, no motion or fake pass"
+      },
+      {
+        "path": "patches/mount-tolerance.patch",
+        "tracked_modified_files": 2,
+        "new_files": 0,
+        "purpose": "proof mount compared by quaternion angle: TOML vs JSON round-trip may differ by one ULP; build .7"
+      },
+      {
+        "path": "patches/startup-head-retry.patch",
+        "tracked_modified_files": 2,
+        "new_files": 0,
+        "purpose": "head IMU startup keeps 5-40 ms encoder pairs: retry at control period instead of 1 s; build .8"
       }
     ],
-    "diagnostic_build": "replica-imu-verify-control.48-head-bmi088.4",
+    "diagnostic_build": "replica-imu-verify-control.48-head-bmi088.8",
     "api_version": 45
   },
   "model": {

@@ -7,7 +7,7 @@ extern "C"
 {
 #endif
 
-    /* 校准会话 ABI v2 独立于估计 ABI v1；错误文本 UTF-8，角度 deg、角速度 rad/s。 */
+    /* 校准 ABI v2 布局保持；未知测量为 NaN，错误文本 UTF-8，角度 deg、角速度 rad/s。 */
     struct MicroduckHeadCalibrationStatus
     {
         unsigned int abiVersion;
@@ -20,7 +20,7 @@ extern "C"
         double bodyGyroRmsRadS;
         double bodyGyroPeakRadS;
         double headSpanDeg;
-        double gyroRelativeErrorRatio;
+        double gyroRelativeErrorRatio; // 新端点契约：三个单向区间中最大的积分旋转相对误差。
         char reason[256];
     };
 
@@ -35,9 +35,16 @@ extern "C"
                                            const struct MicroduckHeadInput* input,
                                            const struct MicroduckEncoderPair* encoders);
 
+    /** 清空当前头部运动证据以开始或重试；仅允许步骤 6–9，不改变既有安装或进度。 */
+    int microduck_head_calibration_reset_motion(void* session);
+
+    /** 跳过头部偏航（ID32）自动测试：仅在步骤 8 有效，推进到 9；
+     * 不产生测量、不伪造通过，报告以 skipped_yaw_v1 明确标记“未测”。 */
+    int microduck_head_calibration_skip_yaw(void* session);
+
     /** 获取状态，或验证当前步骤（capture=1）；失败保留步骤，可修正姿态后重试。
  * 步骤 0–4：站姿摆正/前倾/后倾/左倾/右倾；前后配对及右倾作为复核；
- * 5：桌面站姿基准；6–9：身体站姿保持、逐个自动测试 ID30–33；10 表示核验齐全。
+ * 5：桌面站姿基准；6–9：ID30–33 四停稳端点及三段单向累计旋转；10 表示核验齐全。
  * 成功不写文件、不授权电机；实际运动由原生控制器独占调度。
  */
     int microduck_head_calibration_capture(void* session,

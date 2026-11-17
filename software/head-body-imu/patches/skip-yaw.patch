@@ -1,0 +1,160 @@
+--- a/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
++++ b/microduck-hd1910/firmware/duck-control/src/head_calibration.rs
+@@ -31,6 +31,7 @@
+ type Destroy = unsafe extern "C" fn(*mut c_void);
+ type Observe = unsafe extern "C" fn(*mut c_void, *const HeadInput, *const EncoderPair) -> i32;
+ type ResetMotion = unsafe extern "C" fn(*mut c_void) -> i32;
++type SkipYaw = unsafe extern "C" fn(*mut c_void) -> i32;
+ type Capture = unsafe extern "C" fn(*mut c_void, u32, u32, *mut Status) -> i32;
+ 
+ /// 绑定实际头部零位、方向及冻结模型；标志和 motion_enabled 不作为安装几何的一部分。
+@@ -56,6 +57,7 @@
+     observe: Observe,
+     capture: Capture,
+     reset_motion: ResetMotion,
++    skip_yaw: SkipYaw,
+     binding: Value,
+     epoch: Option<u32>,
+     sequence: Option<u32>,
+@@ -97,6 +99,11 @@
+                 .get::<ResetMotion>(b"microduck_head_calibration_reset_motion\0")
+                 .map_err(|error| error.to_string())?
+         };
++        let skip_yaw = unsafe {
++            *library
++                .get::<SkipYaw>(b"microduck_head_calibration_skip_yaw\0")
++                .map_err(|error| error.to_string())?
++        };
+         let handle = unsafe { create() };
+         if handle.is_null() {
+             return Err("无法创建头部安装核验会话".into());
+@@ -108,6 +115,7 @@
+             observe,
+             capture,
+             reset_motion,
++            skip_yaw,
+             binding: binding(calibration),
+             epoch: None,
+             sequence: None,
+@@ -169,6 +177,20 @@
+         Ok(())
+     }
+ 
++    /// 跳过偏航（ID32）测试；仅当核心停在步骤 8 时推进，报告明确标记未测。
++    pub fn skip_yaw(&mut self) -> Result<Value, String> {
++        self.require_fresh()?;
++        if unsafe { (self.skip_yaw)(self.handle) } != 0 {
++            return Err("只能跳过偏航（ID32）这一步".into());
++        }
++        self.reports.push(json!({"step":8,"sample_count":0,"sample_span_s":0.0,
++            "max_body_error_deg":Value::Null,"body_gyro_rms_rad_s":Value::Null,
++            "body_gyro_peak_rad_s":Value::Null,"head_span_deg":Value::Null,
++            "gyro_integral_error_ratio":Value::Null,"method":"skipped_yaw_v1",
++            "endpoint_count":0,"segment_count":0,"rate_quality":"not_measured","skipped":true}));
++        self.capture(0, false)
++    }
++
+     /// 查询或采集下一步骤；失败保留当前步骤，成功结果包含实测误差与采样数量。
+     pub fn capture(&mut self, step: u32, capture: bool) -> Result<Value, String> {
+         if capture
+@@ -250,6 +272,16 @@
+             .and_then(Value::as_f64)
+             .filter(|value| value.is_finite())
+     };
++    if index == 8 && report.get("skipped") == Some(&json!(true)) {
++        // 偏航按用户设置跳过：只认明确标记、零证据的跳过行，不能冒充实测通过。
++        return report.get("step") == Some(&json!(index))
++            && report.get("method") == Some(&json!("skipped_yaw_v1"))
++            && report.get("sample_count") == Some(&json!(0))
++            && report.get("sample_span_s") == Some(&json!(0.0))
++            && report.get("endpoint_count") == Some(&json!(0))
++            && report.get("segment_count") == Some(&json!(0))
++            && report.get("rate_quality") == Some(&json!("not_measured"));
++    }
+     let basic = report.get("step") == Some(&json!(index))
+         && report
+             .get("sample_count")
+@@ -373,6 +405,38 @@
+         std::fs::remove_dir_all(directory).unwrap();
+     }
+ 
++    /// 偏航跳过必须是步骤 8 的零证据明确标记；换到别步或丢掉方法标识都拒绝。
++    #[test]
++    fn skipped_yaw_is_an_explicit_zero_evidence_report() {
++        let (calibration, mut proof) = fixture();
++        let skip = json!({"step":8,"sample_count":0,"sample_span_s":0.0,
++            "max_body_error_deg":null,"body_gyro_rms_rad_s":null,"body_gyro_peak_rad_s":null,
++            "head_span_deg":null,"gyro_integral_error_ratio":null,"method":"skipped_yaw_v1",
++            "endpoint_count":0,"segment_count":0,"rate_quality":"not_measured","skipped":true});
++        proof["reports"][8] = skip.clone();
++        let directory = std::env::temp_dir().join(format!(
++            "head-proof-skip-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        std::fs::create_dir(&directory).unwrap();
++        let path = directory.join("calibration.toml");
++        save_proof(&path, &proof).unwrap();
++        assert!(verified_proof(&path, &calibration).is_some(), "explicit yaw skip accepted");
++        let mut wrong_step = proof.clone();
++        wrong_step["reports"][7] = skip.clone();
++        save_proof(&path, &wrong_step).unwrap();
++        assert!(verified_proof(&path, &calibration).is_none(), "skip only at the yaw step");
++        let mut no_marker = proof.clone();
++        no_marker["reports"][8]["skipped"] = json!(false);
++        save_proof(&path, &no_marker).unwrap();
++        assert!(verified_proof(&path, &calibration).is_none(), "skip needs the explicit marker");
++        std::fs::remove_dir_all(directory).unwrap();
++    }
++
+     /// 真实库有独立校准 ABI，但创建会话、查询或伪造步号不能替代真实采样。
+     #[test]
+     #[ignore = "requires MICRODUCK_HEAD_CORE_TEST_LIB; run verify-native.sh"]
+@@ -386,6 +450,9 @@
+         let status = session.capture(0, false).unwrap();
+         assert_eq!(status["next_step"], 0);
+         assert_eq!(status["ready_to_save"], false);
++        // 早于偏航步骤时拒绝跳过，且不能留下任何报告行。
++        assert!(session.skip_yaw().is_err());
++        assert_eq!(session.capture(0, false).unwrap()["reports"], json!([]));
+         assert_eq!(status["mount"], Value::Null);
+         assert_eq!(status["reports"], json!([]));
+         assert_eq!(std::mem::size_of::<Status>(), 352);
+--- a/microduck-hd1910/firmware/robotd/src/head_imu_standing.rs
++++ b/microduck-hd1910/firmware/robotd/src/head_imu_standing.rs
+@@ -247,6 +247,21 @@
+             self.pause(Some(hold), samples, &error);
+             return;
+         }
++        // 偏航（ID32）按用户设置跳过：不建轨迹、不采样本，报告明确标记未测。
++        if self.testing && self.next_step == 8 {
++            match self.core.skip_yaw() {
++                Ok(status) => {
++                    self.next_step = status["next_step"].as_u64().unwrap_or(9) as u32;
++                    self.sweep = None;
++                    self.step_started = now;
++                    self.attempted = now;
++                    self.not_before = now + PREPARE_TIME;
++                    self.message = "ID32 偏航按设置跳过（未测，不作安装依据），继续 ID33 横滚".into();
++                }
++                Err(error) => self.pause(Some(hold), samples, &error),
++            }
++            return;
++        }
+         if self.testing && self.next_step >= 6 {
+             if self.sweep.is_none() {
+                 let id = 30 + (self.next_step - 6) as u8;
+--- a/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
++++ b/microduck-hd1910/firmware/robotd/src/feetech_commissioning.rs
+@@ -22,7 +22,7 @@
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::sync::oneshot;
+ 
+-pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.5";
++pub const BUILD: &str = "replica-imu-verify-control.48-head-bmi088.6";
+ const MAX_PENDING: usize = 16;
+ const POSITION_TOLERANCE: u16 = 8;
+ const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
