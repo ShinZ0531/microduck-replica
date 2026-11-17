@@ -19,13 +19,14 @@ def head_fixture():
     quat = [0.5, 0.5, 0.5, 0.5]
     calibration["imu_mounts"]["head_bmi088"] = {"quat": quat, "verified": True}
     proof = {
-        "contract": "head_mount_standing_v2", "source": "head_bmi088", "mount": quat,
+        "contract": "head_mount_endpoints_v3", "source": "head_bmi088", "mount": quat,
         "binding": {"model_sha256": "078693dff3bcd5e69eb6cc483974178e1511a11f762b1a4dd00370bc5d58b8a8",
                     "joints": [{key: row.get(key) for key in ("id", "name", "zero_raw", "direction")}
                                for row in calibration["joints"] if row["id"] in (30, 31, 32, 33)]},
         "reports": [{"step": step, "sample_count": 100, "sample_span_s": 1.98,
                      "max_body_error_deg": 0.5, "body_gyro_rms_rad_s": 0.02, "body_gyro_peak_rad_s": 0.05,
-                     "gyro_relative_error_ratio": 0.1, "head_span_deg": 12.0 if 6 <= step <= 9 else 0.0} for step in range(10)],
+                     "gyro_integral_error_ratio": 0.1, "method": "settled_endpoints_segment_integral_v1",
+                     "endpoint_count": 4, "segment_count": 3, "rate_quality": "diagnostic_only", "head_span_deg": 12.0 if 6 <= step <= 9 else 0.0} for step in range(10)],
     }
     return calibration, proof
 
@@ -37,7 +38,7 @@ class HeadProofTest(unittest.TestCase):
         """报告缺步、关节几何改变及超差残差均被拒绝。"""
         calibration, proof = head_fixture()
         C.require_head_proof(calibration, proof, proof["mount"])
-        for change in ("missing", "zero", "gyro", "error", "span", "ratio", "old_contract"):
+        for change in ("missing", "zero", "gyro", "error", "span", "ratio", "method", "endpoints", "segments", "old_contract"):
             changed, record = copy.deepcopy(calibration), copy.deepcopy(proof)
             if change == "missing":
                 record["reports"].pop()
@@ -46,11 +47,45 @@ class HeadProofTest(unittest.TestCase):
             elif change == "zero":
                 changed["joints"][6]["zero_raw"] += 1
             else:
-                key, value = {"gyro": ("body_gyro_rms_rad_s", 0.3), "error": ("max_body_error_deg", 8.0),
-                              "span": ("head_span_deg", 1.0), "ratio": ("gyro_relative_error_ratio", 1.0)}[change]
+                key, value = {"gyro": ("body_gyro_rms_rad_s", float("nan")), "error": ("max_body_error_deg", 8.0),
+                              "span": ("head_span_deg", 1.0), "ratio": ("gyro_integral_error_ratio", 1.0),
+                              "method": ("method", "legacy_velocity"), "endpoints": ("endpoint_count", 3),
+                              "segments": ("segment_count", True)}[change]
                 record["reports"][6][key] = value
             with self.subTest(change=change), self.assertRaises(C.CalibError):
                 C.require_head_proof(changed, record, proof["mount"])
+
+    def test_stutter_rate_diagnostics_do_not_block_valid_endpoints(self):
+        """有效端点与分段积分不被途中角速度卡顿拦住；Python 与特权助手必须同口径。"""
+        calibration, proof = head_fixture()
+        for report in proof["reports"][6:]:
+            report["body_gyro_rms_rad_s"] = 0.3
+            report["body_gyro_peak_rad_s"] = 0.9
+        for module in (C, H):
+            module.require_head_proof(calibration, proof, proof["mount"])
+
+    def test_yaw_skip_is_zero_evidence_and_only_at_step_eight(self):
+        """用户跳过的偏航只接受步骤 8 的零证据标记；换步、带数值或去掉标记都拒绝。"""
+        calibration, proof = head_fixture()
+        skip = {"step": 8, "sample_count": 0, "sample_span_s": 0.0,
+                "max_body_error_deg": None, "body_gyro_rms_rad_s": None, "body_gyro_peak_rad_s": None,
+                "head_span_deg": None, "gyro_integral_error_ratio": None, "method": "skipped_yaw_v1",
+                "endpoint_count": 0, "segment_count": 0, "rate_quality": "not_measured", "skipped": True}
+        proof["reports"][8] = skip
+        for module in (C, H):
+            module.require_head_proof(calibration, proof, proof["mount"])
+        for change in ("wrong_step", "not_skipped", "measured", "no_method"):
+            record = copy.deepcopy(proof)
+            if change == "wrong_step":
+                record["reports"][7], record["reports"][8] = copy.deepcopy(skip), copy.deepcopy(record["reports"][7])
+            elif change == "not_skipped":
+                record["reports"][8]["skipped"] = False
+            elif change == "measured":
+                record["reports"][8]["sample_count"] = 100
+            else:
+                record["reports"][8]["method"] = "settled_endpoints_segment_integral_v1"
+            with self.subTest(change=change), self.assertRaises(C.CalibError):
+                C.require_head_proof(calibration, record, proof["mount"])
 
     def test_build_preserves_zero_direction_and_existing_limits(self):
         """两份纯函数均保留实测零位和已有限位，同时只填充原配置中缺失的通用限位。"""

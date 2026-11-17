@@ -727,7 +727,8 @@ function collectWords(W) {
   return [n ? `下一个：${n.cn}` : '都齐了', tip];
 }
 
-function CollectCard({ st, imu, live, W, act, muted, setMuted }) {
+/** 复用原有圆圈、倾角和采集提示；头部来源的控制及完成状态由原生会话提供。 */
+function CollectCard({ st, imu, live, W, act, muted, setMuted, native = null }) {
   const block = blockReason(st, imu, live);
   const ph = W.phase;
   const guardErr = st?.guard?.max_joint_error_deg;
@@ -735,19 +736,33 @@ function CollectCard({ st, imu, live, W, act, muted, setMuted }) {
   const mute = html`<label class="imu-mute" title="做够一个方向时响一声"><input type="checkbox" checked=${muted}
     onChange=${(e) => setMuted(e.target.checked)} /> 静音</label>`;
   let button;
-  if (ph === 'collect') button = html`<button class="imu-big rec" onClick=${act.end}><span class="rec-dot"></span>采集中…（点这里结束）</button>`;
+  if (native) button = null;
+  else if (ph === 'collect') button = html`<button class="imu-big rec" onClick=${act.end}><span class="rec-dot"></span>采集中…（点这里结束）</button>`;
   else if (ph === 'solving') button = html`<button class="imu-big" disabled>正在算…</button>`;
   else if (ph === 'short') button = html`<button class="imu-big" onClick=${act.resume}>接着采</button>`;
   else button = html`<button class="imu-big" disabled=${!!block} onClick=${act.start}>${ph === 'idle' ? '开始采集' : '重新采集'}</button>`;
-  const [say, sub] = ph === 'collect' ? collectWords(W) : ['', ''];
+  let say = '', sub = '';
+  if (native) {
+    sub = native.message || '准备开始整机站姿采集';
+    if (!native.running) {
+      say = '整机采集已停止，已采进度保留';
+    } else if (!W.done.still) {
+      say = '放在平桌上，松手，别碰它';
+    } else {
+      say = `按圆圈提示：${STEP[nextTodo(W)]?.cn || '四向已完成'}`;
+    }
+  } else if (ph === 'collect') {
+    [say, sub] = collectWords(W);
+  }
   return html`<section class="board imu-card imu-collect">
     <h3>站着校准 <span class="sv-small">约 1 分钟 · 两只手</span>${mute}</h3>
     ${ph === 'idle' ? html`<ol class="imu-howto">
       <li>鸭子站好（点上面的「站姿使能」或者按手柄 +，别开走路），点「开始采集」。</li>
       <li>放在平桌上，<b>别碰它 3 秒</b>。</li>
       <li>站到鸭子后面（跟它朝一个方向，它的左就是你的左），双手捏住躯干两侧提起来，<b>前、后、左、右各倾一次</b>：
-        每次先端平停半秒，再倾 15° 左右停 1 秒。顺序随便，3D 上的箭头会示范。</li>
-      <li>做够一个方向那个点就亮、响一声；四个都亮了自动结束、自动算。</li>
+        ${native ? '每次先端平停半秒，再按圆圈亮起的方向倾 15–20°，停稳约 2 秒。3D 箭头会示范。'
+          : '每次先端平停半秒，再倾 15° 左右停 1 秒。顺序随便，3D 上的箭头会示范。'}</li>
+      <li>做够一个方向那个点就亮、响一声；${native ? '四个都亮后，放回桌面站稳，再开始下方头部测试。' : '四个都亮了自动结束、自动算。'}</li>
     </ol>` : null}
     ${ph === 'collect' || ph === 'solving' || ph === 'short' ? html`<div class="imu-live">
       <${DirPad} W=${W} />
@@ -756,17 +771,71 @@ function CollectCard({ st, imu, live, W, act, muted, setMuted }) {
           ${!W.done.still ? html`<div class="imu-bar" aria-label="静止进度"><span style=${{ width: `${Math.round(W.progress * 100)}%` }}></span></div>`
             : html`<p class="imu-tilt num"><b>${fmt(W.live?.t)}°</b><span>离端平那一下</span></p>`}`
         : ph === 'solving' ? html`<p class="imu-say"><b>采完了，正在算…</b></p>`
+          : native ? html`<p class="imu-say"><b>整机采集已停止</b><br />
+            <span class="sv-small">已采集的方向保留，使用下方按钮继续。${native.message || ''}</span></p>`
           : html`<p class="imu-say"><b>还差：${names(W.missing)}</b><br />
             <span class="sv-small">做过的都留着。点「接着采」把${names(W.missing)}补上；不想要这一遍就「重来」。</span></p>`}
       </div>
     </div>` : null}
+    ${native && ph === 'done' ? html`<div class="imu-live"><${DirPad} W=${W} />
+      <p>整机四向采集完成。放回平桌保持站立，在下方单独开始头部测试。</p></div>` : null}
     ${ph === 'error' ? html`<div class="banner bad" role="alert"><b>没算成</b><span class="more">${W.error}</span></div>` : null}
     ${ph === 'done' && res && !res.ok ? html`<p class="sv-warn">没校成，原因和要补做哪步在下面「结果」里。</p>` : null}
-    ${block && ph !== 'solving' ? html`<p class="sv-warn">${block}</p>`
+    ${!native && block && ph !== 'solving' ? html`<p class="sv-warn">${block}</p>`
       : ph === 'idle' && guardErr != null && guardErr > 5 ? html`<p class="sv-warn">腿离 HOME 还差 ${fmt(guardErr)}°：站姿不准，补偿也会跟着不准。先把舵机零位校好</p>` : null}
     <div class="imu-actions">${button}
-      ${ph === 'short' || ph === 'collect' ? html`<button class="btn-light" onClick=${act.start} disabled=${!!block && ph !== 'collect'}>重来</button>` : null}</div>
+      ${!native && (ph === 'short' || ph === 'collect') ? html`<button class="btn-light" onClick=${act.start} disabled=${!!block && ph !== 'collect'}>重来</button>` : null}</div>
   </section>`;
+}
+
+/** 原生整机采集的视觉适配：复用旧向导的圆圈跟随与停住显示，完成点只认主控进度。 */
+export function HeadBodyCaptureCard({ st, imu, live, state, muted, setMuted }) {
+  const preview = useRef(freshWizard());
+  const previousStep = useRef(0);
+  const [, bump] = useState(0);
+  useEffect(() => {
+    const w = preview.current;
+    const step = Math.min(state?.next_step ?? 0, 5);
+    if (!state?.active) {
+      Object.assign(w, freshWizard());
+      previousStep.current = 0;
+    } else {
+      if (w.phase === 'idle' && state.running) {
+        startCollect(w, performance.now() / 1000);
+      }
+      // 原生可能先确认静止段；显示参考不能依赖前端恰好采满三秒。
+      if (step === 0 && okVec(st?.gravity)) {
+        w.g0 = unit(st.gravity);
+      }
+      if (!w.g0) {
+        w.g0 = DOWN;
+      }
+      if (state.running && step < 5) {
+        w.phase = 'collect';
+        feed(w, st, live);
+      }
+      // 前端采集只画实时位置和停住进度；不得以它的自动判定替代主控采样结果。
+      for (let index = 0; index < STEPS.length; index++) {
+        w.done[STEPS[index]] = index < step;
+      }
+      w.events.length = 0;
+      if (step >= 5) {
+        w.phase = 'done';
+      } else if (state.running) {
+        w.phase = 'collect';
+      } else {
+        w.phase = 'short';
+      }
+      w.missing = missingSteps(w);
+      if (step > previousStep.current && !muted) {
+        beep(step >= 5 ? 'all' : STEPS[step - 1]);
+      }
+      previousStep.current = step;
+    }
+    bump((value) => value + 1);
+  }, [st, state, live, muted]);
+  return html`<${CollectCard} st=${st} imu=${imu} live=${live} W=${preview.current}
+    muted=${muted} setMuted=${setMuted} native=${state || { active: false }} />`;
 }
 
 const GRADE = { good: ['好', 'ok'], ok: ['能用', 'warn'], coarse: ['粗校', 'warn'] };
@@ -1028,6 +1097,7 @@ export function ImuPage({ st, imu, link, live, age, diagnosticElapsed = 0, pd })
   const [, bump] = useState(0);
   const redraw = () => bump((n) => n + 1);
   const [res, setRes] = useState(null);
+  const [headState, setHeadState] = useState(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
   const [muted, setMutedState] = useState(loadMute);
@@ -1077,8 +1147,13 @@ export function ImuPage({ st, imu, link, live, age, diagnosticElapsed = 0, pd })
   const w = W.current;
   const S = statusOf(st, imu, live);
   const F = freshText(st, live, age);
-  const arrow = w.phase === 'collect' && w.done.still ? nextTodo(w) : null;
-  const cue = w.phase === 'collect' ? (!w.done.still ? '静止 3 秒：别碰它' : arrow ? `下一个：${STEP[arrow].cn}（顺序随便）` : null) : null;
+  const bodyCaptureRunning = imu?.source === 'head_bmi088' && headState?.active && headState.running && headState.next_step < 5;
+  let arrow = w.phase === 'collect' && w.done.still ? nextTodo(w) : null;
+  let cue = w.phase === 'collect' ? (!w.done.still ? '静止 3 秒：别碰它' : arrow ? `下一个：${STEP[arrow].cn}（顺序随便）` : null) : null;
+  if (bodyCaptureRunning) {
+    arrow = headState.next_step > 0 ? STEPS[headState.next_step] : null;
+    cue = arrow ? `下一个：${STEP[arrow].cn}` : '站在平桌上静止采集';
+  }
   return html`<div class="imu-page">
     <header class="sv-head"><h1>IMU</h1><span class="sv-sub">HAT 原始读数与主程序躯干姿态</span></header>
     <${HeadImuPanel} />
@@ -1098,13 +1173,15 @@ export function ImuPage({ st, imu, link, live, age, diagnosticElapsed = 0, pd })
       <a href="#" onClick=${(e) => { e.preventDefault(); setMsg(null); }}>知道了</a></div>` : null}
     <div class="imu-grid">
       <${ImuStage} st=${st} stale=${!F.live} corr=${res?.ok ? res.correction : null} parts=${res?.parts}
-        collecting=${w.phase === 'collect'} arrow=${arrow} cue=${cue} />
+        collecting=${bodyCaptureRunning || w.phase === 'collect'} arrow=${arrow} cue=${cue} />
       <div class="imu-side">
         <${StatusCard} st=${st} imu=${imu} live=${live} age=${age} diagnosticElapsed=${diagnosticElapsed} />
         <${DiagnosticCard} st=${st} imu=${imu} live=${live} diagnosticElapsed=${diagnosticElapsed} />
         ${imu?.source === 'head_bmi088'
           ? html`<${StanceCard} st=${st} imu=${imu} pd=${pd} link=${link} live=${live} />
-        <${HeadCalibrationPanel} imu=${imu} link=${link} live=${live} />`
+        <${HeadCalibrationPanel} imu=${imu} link=${link} live=${live} onState=${setHeadState} onStart=${audioUnlock}
+          bodyCapture=${html`<${HeadBodyCaptureCard} st=${st} imu=${imu} live=${live} state=${headState}
+            muted=${muted} setMuted=${setMuted} />`} />`
           : html`<${CoarseCard} st=${st} imu=${imu} link=${link} live=${live} />
         <${StanceCard} st=${st} imu=${imu} pd=${pd} link=${link} live=${live} />
         <${CollectCard} st=${st} imu=${imu} live=${live} W=${w} act=${act} muted=${muted} setMuted=${setMuted} />

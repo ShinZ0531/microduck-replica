@@ -10,10 +10,13 @@ assert(Number.isInteger(port) && port > 0 && port < 65536, '需要本机测试�
 const output = process.argv[3];
 const web = resolve(dirname(fileURLToPath(import.meta.url)), '../web');
 const harness = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<style>body{background:#18191d;color:#eee;font:16px sans-serif;margin:24px;line-height:1.6}
+<script type="importmap">{"imports":{"three":"/vendor/three/three.module.js"}}</script>
+<link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/imu.css"><link rel="stylesheet" href="/head-imu.css">
+<style>body{background:#f5f5f7;color:#1d1d1f;font:16px sans-serif;margin:24px;line-height:1.6}
 button,input{font:inherit;margin:8px;padding:8px}button:disabled{opacity:.4}li{margin:4px 0}section{max-width:850px}</style>
 <main id="root"></main><script type="module">
-import {html,render} from '/vendor/preact-htm.module.js';
+import {html,render,useState} from '/vendor/preact-htm.module.js';
+import {HeadBodyCaptureCard} from '/imu.js';
 import {HeadCalibrationPanel} from '/head-calibration.js';
 window.calls=[];window.phase={active:false};window.failNext=false;
 window.fakeLink={
@@ -37,8 +40,16 @@ async cmd(name,args){
  return {ok:true,data:structuredClone(window.phase)};
 }};
 window.unmount=()=>render(null,document.querySelector('#root'));
-render(html\`<\${HeadCalibrationPanel} imu=\${{source:'head_bmi088',mode:'commissioning',hold:{stage:'holding'}}}
-    link=\${window.fakeLink} live=\${true} />\`,document.querySelector('#root'));
+/** 使用真正的旧圆圈组件与新向导组合，不以替身 UI 冒充恢复效果。 */
+function Harness(){
+ const [state,setState]=useState(null);
+ const imu={source:'head_bmi088',mode:'commissioning',hold:{stage:'holding'}};
+ return html\`<\${HeadCalibrationPanel} imu=\${imu} link=\${window.fakeLink} live=\${true}
+   onState=\${setState} bodyCapture=\${html\`<\${HeadBodyCaptureCard} imu=\${imu}
+    st=\${{mode:'commissioning',hold:{stage:'holding'},gravity:window.gravity||[0,0,-1],joints_age_ms:10,state_t_ns:performance.now()}}
+    state=\${state} live=\${true} muted=\${true} setMuted=\${()=>{}} />\`} />\`;
+}
+render(html\`<\${Harness} />\`,document.querySelector('#root'));
 </script>`;
 
 /** 只服务源码目录和固定测试 HTML；不代理网络请求。 */
@@ -51,7 +62,7 @@ const server = createServer(async (request, response) => {
         }
         const path = resolve(web, `.${new URL(request.url, 'http://localhost').pathname}`);
         assert(path.startsWith(`${web}/`));
-        response.setHeader('content-type', extname(path) === '.js' ? 'text/javascript' : 'application/octet-stream');
+        response.setHeader('content-type', extname(path) === '.js' ? 'text/javascript' : extname(path) === '.css' ? 'text/css' : 'application/octet-stream');
         response.end(await readFile(path));
     } catch {
         response.writeHead(404);
@@ -69,7 +80,7 @@ socket.addEventListener('message', (event) => {
     const message = JSON.parse(event.data);
     pending.get(message.id)?.(message);
     if (message.method === 'Runtime.exceptionThrown') {
-        errors.push(message.params.exceptionDetails.text);
+        errors.push(message.params.exceptionDetails.exception?.description || message.params.exceptionDetails.text);
     }
 });
 
@@ -110,13 +121,13 @@ async function waitFor(expression) {
         }
         await new Promise((resolveWait) => setTimeout(resolveWait, 25));
     }
-    throw new Error(`DOM condition timed out: ${expression}`);
+    throw new Error(`DOM condition timed out: ${expression}; errors=${JSON.stringify(errors)}; body=${await evaluate("document.body?.textContent")}`);
 }
 
 /** 通过用户实际可见的确认框和主按钮执行一步，不直接调用组件内部函数。 */
 async function clickMain() {
-    await waitFor(`!!document.querySelector('input[type=checkbox]')`);
-    await evaluate(`if(!document.querySelector('input').checked)document.querySelector('input').click()`);
+    await waitFor(`!!document.querySelector('.head-calibration > label > input[type=checkbox]')`);
+    await evaluate(`if(!document.querySelector('.head-calibration > label > input').checked)document.querySelector('.head-calibration > label > input').click()`);
     await waitFor(`!document.querySelector('button.btn-dark').disabled`);
     await evaluate(`document.querySelector('button.btn-dark').click()`);
 }
@@ -138,9 +149,14 @@ try {
     await waitFor(`!!document.querySelector('button.btn-dark')`);
     assert.equal(await evaluate(`document.querySelector('button.btn-dark').disabled`), true);
     await clickMain();
-    await waitFor(`window.phase.next_step>=1`);
+    await waitFor(`window.phase.next_step>=1 && !!document.querySelector('.imu-pad')`);
+    const circleBefore = await evaluate(`document.querySelector('.pad-live')?.getAttribute('cy')`);
+    await evaluate(`window.gravity=[Math.sin(Math.PI/9),0,-Math.cos(Math.PI/9)]`);
+    await waitFor(`document.querySelector('.pad-live')?.getAttribute('cy') !== ${JSON.stringify(circleBefore)}`);
+    assert(await evaluate(`!!document.querySelector('.imu-pad .pad-dot.center.done')`),'body completion dots follow native progress');
+    await screenshot('body-capture-running.png');
     await evaluate(`document.querySelector('button.btn-dark').click()`);
-    await waitFor(`window.phase.running===false && !!document.querySelector('input')`);
+    await waitFor(`window.phase.running===false && !!document.querySelector('.head-calibration > label > input')`);
     const pausedStep=await evaluate('window.phase.next_step');
     await new Promise((resolveWait)=>setTimeout(resolveWait,1300));
     assert.equal(await evaluate('window.phase.next_step'),pausedStep,'status cannot resume paused work');
@@ -149,14 +165,14 @@ try {
     await screenshot('head-calibration-mobile.png');
     assert(await evaluate(`document.documentElement.scrollWidth<=innerWidth+1`));
     await clickMain();
-    await waitFor(`window.phase.next_step===5 && !!document.querySelector('input')`,10000);
+    await waitFor(`window.phase.next_step===5 && !!document.querySelector('.head-calibration > label > input')`,10000);
     assert.equal(await evaluate(`window.calls.filter(c=>c.args.op==='head-test').length`),0,'head motion requires separate consent');
     await evaluate('window.failNext=true');
     await clickMain();
     await waitFor(`window.phase.next_step===7 && window.phase.running===false && document.querySelector('section').textContent.includes('补偿误差过大')`,10000);
     assert.equal(await evaluate(`window.calls.filter(c=>c.args.op==='head-save').length`),0);
     await clickMain();
-    await waitFor(`window.phase.next_step===10 && !!document.querySelector('input')`,10000);
+    await waitFor(`window.phase.next_step===10 && !!document.querySelector('.head-calibration > label > input')`,10000);
     assert.equal(await evaluate(`window.calls.filter(c=>c.args.op==='head-save').length`),0,'automatic completion never saves');
     await clickMain();
     await waitFor(`document.querySelector('section').textContent.includes('已保存头部安装核验')`);

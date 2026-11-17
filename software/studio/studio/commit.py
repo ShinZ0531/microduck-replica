@@ -231,7 +231,7 @@ def head_quat_matches(left, right):
 
 def require_head_proof(calibration, proof, quat):
     """核对原生十步报告与当前安装及头部几何；页面确认和旧 pending 不能充当实测证据。"""
-    if not isinstance(proof, dict) or proof.get("contract") != "head_mount_standing_v2":
+    if not isinstance(proof, dict) or proof.get("contract") != "head_mount_endpoints_v3":
         raise CalibError("头部 BMI088 还未完成专用安装核验：去 IMU 页按步骤采集并保存")
     mount = (calibration.get("imu_mounts") or {}).get("head_bmi088") or {}
     expected = {"model_sha256": "078693dff3bcd5e69eb6cc483974178e1511a11f762b1a4dd00370bc5d58b8a8",
@@ -244,13 +244,28 @@ def require_head_proof(calibration, proof, quat):
             or len(expected["joints"]) != 4 or not isinstance(reports, list) or len(reports) != 10):
         raise CalibError("头部核验报告与当前安装、关节零位或方向不一致，请重新核验")
     for index, report in enumerate(reports):
-        if (not isinstance(report, dict) or type(report.get("step")) is not int or report["step"] != index
-                or type(report.get("sample_count")) is not int or report["sample_count"] < 60
+        if (not isinstance(report, dict) or type(report.get("step")) is not int or report["step"] != index):
+            raise CalibError("头部核验报告缺少有效的独立采样证据")
+        if index == 8 and report.get("skipped") is True:
+            # 偏航按用户设置跳过：只接受零证据标记，不能把跳过当成实测通过。
+            if (report.get("method") != "skipped_yaw_v1" or report.get("sample_count") != 0
+                    or report.get("sample_span_s") != 0 or report.get("endpoint_count") != 0
+                    or report.get("segment_count") != 0 or report.get("rate_quality") != "not_measured"):
+                raise CalibError("偏航跳过标记不完整，不能当作实测通过")
+            continue
+        if (type(report.get("sample_count")) is not int or report["sample_count"] < 60
                 or not _is_num(report.get("sample_span_s")) or report["sample_span_s"] < 1.5):
             raise CalibError("头部核验报告缺少有效的独立采样证据")
         if 6 <= index <= 9:
-            limits = (("max_body_error_deg", 0.0, 5.0), ("body_gyro_rms_rad_s", 0.0, 0.15),
-                      ("body_gyro_peak_rad_s", 0.0, 0.5), ("head_span_deg", 8.0, 360.0), ("gyro_relative_error_ratio", 0.0, 0.5))
+            limits = (("max_body_error_deg", 0.0, 3.0), ("body_gyro_rms_rad_s", 0.0, math.inf),
+                      ("body_gyro_peak_rad_s", 0.0, math.inf), ("head_span_deg", 8.0, 360.0),
+                      ("gyro_integral_error_ratio", 0.0, 0.5))
+            # 瞬时 RMS/峰值仅保留诊断；安装依据是四个停稳端点及三个独立单向区间。
+            if (report.get("method") != "settled_endpoints_segment_integral_v1"
+                    or type(report.get("endpoint_count")) is not int or report["endpoint_count"] != 4
+                    or type(report.get("segment_count")) is not int or report["segment_count"] != 3
+                    or report.get("rate_quality") != "diagnostic_only"):
+                raise CalibError("头部核验缺少完整端点和单向累计旋转证据")
             if any(not _is_num(report.get(key)) or not low <= report[key] <= high for key, low, high in limits):
                 raise CalibError("头部运动补偿实测误差未达到核验条件")
     return proof
