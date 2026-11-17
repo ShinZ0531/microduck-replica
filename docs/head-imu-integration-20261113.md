@@ -343,3 +343,68 @@ robotd 的目标为 `aarch64-unknown-linux-gnu.2.31`。构建树中带补丁 pos
 回退入口为 `sudo sh /var/backups/microduck/20261113-head-imu-standing-v4/rollback-standing.sh`。
 它要求部署文件、全部设备配置未被再次改变且仍断力，才恢复 `.3` 主控及 `.2` Studio；
 用户随后保存核验或改配置后会拒绝自动回退，防止覆盖新结果。入口已语法检查，未实切回退。
+
+## 停稳端点版（v5）板端部署（2026-11-16）
+
+在 `.4` 已部署的鸭子上切换到停稳端点版：`replica-imu-verify-control.48-head-bmi088.5`、
+API 45、证明合同 `head_mount_endpoints_v3`。C++ 组件升到 1.3.0，新增
+`head_endpoint_verification.cpp` 与 `microduck_head_calibration_reset_motion`，
+四停稳端点与三段单向陀螺积分由独立源文件计算；校准 C ABI 仍为 v2 布局。
+
+| 产物 | SHA256 |
+| --- | --- |
+| robotd `.5` | `77bf1a2dddf485c589439415f6ce60200cd07bcce556aaa3420c575bf482dec7` |
+| ARM64 C++ 库 1.3.0 | `1e6b43f29908413de37e24fe5fe326305094d4bbee5d4d18d594466816075e4a` |
+| Studio `2026.11.13-head-imu.4` 包 | `5e0a4f5e67807d1e384b8a303485cf5047674f094521303a5b73c1ececec3027` |
+| 部署前设备备份 | `1777b3ada6c4fb16f19132796229cc828b26d979b0aa3052ba4f75b43c76d859` |
+
+本机为 x86-64、鸭子为 aarch64，robotd 与 C++ 库都用 Zig 按
+`aarch64-unknown-linux-gnu.2.31` 交叉构建，安装前核对 ELF 与动态依赖。
+本地 C++ 估计器 1693、端点校验 103242 个断言通过；robotd 头部站姿/校准用例和
+真实动态库用例通过，Python 头部相关 56 项通过。串口伪终端用例受本机 PTY 权限限制未跑通，
+没有据此宣称整库通过。
+
+安装到 `head-body-v5/` 与 `studio-head-endpoints-v5/`，只改设备配置中的
+`trunk_imu.head_estimator_library`、两处服务覆盖与 helper 路径，保留 `--commissioning`。
+切换后 50 次只读采样：cycle 增加 256、IMU 序号增加 254，最大年龄 20.64 ms，约 50.0 Hz；
+15 颗舵机反馈有效、断力、安装未核验；API 回读 45，会话合同为 `head_mount_endpoints_v3` 且 inactive。
+校准文件摘要仍为 `62d52690…`，tofd 与 padd 实例未变化。
+
+安装脚本曾把 `.5` 可执行文件写成 `robotd-head-bmi088.4` 文件名；随即改名并同步覆盖，
+助手期望的 commissioning 覆盖摘要逐字节核对一致，仅重启 robotd，主控仍断力标定。
+修正记录与更新后的文件摘要保存在板端备份目录，回退入口保持可用。
+
+没有开始真实站姿采集、自动头部测试、核验保存或任何运动。
+回退：`sudo sh /var/backups/microduck/20261116-head-imu-endpoints-v5/rollback-endpoints.sh`。
+
+## 偏航跳过（v6，2026-11-16 已上机）
+
+按用户要求，ID32 偏航自动测试改为**跳过**：不移动关节、不采集样本，也不把跳过当成实测通过。
+C++ 校准核心新增 `microduck_head_calibration_skip_yaw`（仅步骤 8 有效），报告写入
+`method=skipped_yaw_v1`、`skipped=true`、样本与端点计数为 0；robotd 调度在同一 Hold 内直接推进到 ID33。
+助手与 Studio 只接受这一零证据标记，其他步骤仍须完整端点与单向积分证据；换步、带数值或缺少标记均拒绝。
+
+本地验证：C++ 109468 断言（含仅步骤 8 可跳、跳后仍需 ID33 实测）、Rust 头部校准用例、
+Python 头部相关 57 项通过；六补丁链从 `eecac18` 重建的 robotd 与工作树逐字节一致，
+ARM64 产物摘要固定。已部署为 `control.48-head-bmi088.6`、C++ 1.4.0、Studio `2026.11.13-head-imu.5`；
+切换后 50 次只读采样正常（约 50 Hz、断力、15 颗反馈），合同摘要、配置与校准文件不变。
+真实站姿采集与偏航跳过行为尚未由用户实测确认。
+
+## 核验报告安装四元数的 1 ULP 比较问题（v7，2026-11-16 已上机）
+
+用户完成 v6 十步核验并保存后，主页上手清单仍把 IMU 判为未完成。板端
+`calibration-status` 的 `head_imu_verification` 为 null，而报告文件本身十步齐全
+（ID30/31/33 端点姿态差约 2.68–2.73°、积分比 0.06–0.17，ID32 为明确跳过行）。
+
+原因：`verified_proof` 用 JSON 值相等比较报告里的安装四元数与标定文件里的四元数。
+校准 TOML 与报告 JSON 由不同的浮点解析器读入，同一个十进制数会差 1 ULP
+（实测首分量 `…c53` 与 `…c52`），于是报告被判不匹配，界面显示“未完成”。
+
+修复：比较改为按单位四元数夹角，容差 1e-6（约 0.16°），仍拒绝真正不同的安装
+（0.5° 偏差用例被拒绝）；新增回归覆盖 1 ULP 接受、换安装拒绝。
+主控版本升为 `control.48-head-bmi088.7`，C++ 库与 Studio 包内容不变（Studio 仅改助手
+`HEAD_START` 指向 v7）。本地用板端真实报告复跑 `verified_proof` 已返回通过；
+C++ 109468、Rust 头部用例、Python 57 项通过。已部署为 `control.48-head-bmi088.7`、
+Studio `2026.11.13-head-imu.6`；切换后 `calibration-status` 返回 10 条报告，
+部署后的 `onboard.imu_row` 实测为 `ok`，校准与证明文件未变。第一次执行在写结果 JSON 时
+引用了不存在的字段，事务自动回退 v6；清理后修正字段重跑成功。
